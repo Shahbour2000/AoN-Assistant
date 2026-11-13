@@ -85,24 +85,37 @@ test('knowledge chunks long sections and retrieves normalized Arabic terms', asy
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('base environment works without credentials; feature requirements are checked when needed', async () => {
+test('all five local Age of Nations wiki files load as source-preserving retrievable chunks', async () => {
+  const root = path.resolve('knowledge');
+  const chunks = await loadKnowledge(root);
+  const expected = ['01-basics.md', '02-economy.md', '03-war.md', '04-politics.md', '05-community.md'];
+  for (const file of expected) {
+    const matching = chunks.filter((chunk) => chunk.source.endsWith(file));
+    assert.ok(matching.length > 0, `${file} should be discovered and chunked`);
+    assert.ok(matching.some((chunk) => retrieve(chunks, chunk.heading, chunks.length).includes(chunk)), `${file} should be retrievable by its section heading`);
+  }
+});
+
+test('Groq API key is required while Discord credentials remain separately validated', async () => {
   const { loadConfig } = await import('../src/config/env.js');
   const original = { ...process.env };
   try {
     delete process.env.DISCORD_TOKEN;
     delete process.env.DISCORD_CLIENT_ID;
-    delete process.env.GEMINI_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    assert.throws(() => loadConfig(), /GROQ_API_KEY/);
+    process.env.GROQ_API_KEY = 'local-test-key';
     const config = loadConfig();
     assert.equal(config.DISCORD_TOKEN, undefined);
-    assert.equal(config.GEMINI_MODEL, 'gemini-2.5-flash');
-    const { requireDiscordConfig, requireGeminiConfig } = await import('../src/config/env.js');
+    assert.equal(config.GROQ_MODEL, 'qwen/qwen3.8-27b');
+    const { requireDiscordConfig, requireGroqConfig } = await import('../src/config/env.js');
     assert.throws(() => requireDiscordConfig(config), /Discord configuration is required/);
-    assert.throws(() => requireGeminiConfig(config), /GEMINI_API_KEY is required/);
+    assert.equal(requireGroqConfig(config).apiKey, 'local-test-key');
+    assert.equal(requireGroqConfig(config).model, 'qwen/qwen3.8-27b');
     process.env.DISCORD_TOKEN = 'local-test-token';
     process.env.DISCORD_CLIENT_ID = 'local-test-client';
-    process.env.GEMINI_API_KEY = 'local-test-key';
     assert.equal(requireDiscordConfig(loadConfig()).token, 'local-test-token');
-    assert.equal(requireGeminiConfig(loadConfig()).model, 'gemini-2.5-flash');
+    assert.equal(requireGroqConfig(loadConfig()).model, 'qwen/qwen3.8-27b');
   } finally {
     process.env = original;
   }

@@ -4,8 +4,8 @@ import { z } from 'zod';
 const schema = z.object({
   DISCORD_TOKEN: z.string().trim().min(1).optional(),
   DISCORD_CLIENT_ID: z.string().trim().min(1).optional(),
-  GEMINI_API_KEY: z.string().trim().min(1).optional(),
-  GEMINI_MODEL: z.string().default('gemini-2.5-flash'),
+  GROQ_API_KEY: z.string().trim().min(1),
+  GROQ_MODEL: z.string().default('qwen/qwen3.8-27b'),
   ASSISTANT_CHANNEL_ID: z.string().trim().min(1).optional(),
   DATABASE_PATH: z.string().default('./data/aon-assistant.sqlite'),
   KNOWLEDGE_DIR: z.string().default('./knowledge'),
@@ -26,7 +26,7 @@ export function requireDiscordConfig(config: ReturnType<typeof loadConfig>) {
   return { token: config.DISCORD_TOKEN, clientId: config.DISCORD_CLIENT_ID };
 }
 
-export function requireGeminiConfig(config: ReturnType<typeof loadConfig>) {
-  if (!config.GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is required for Gemini features.');
-  return { apiKey: config.GEMINI_API_KEY, model: config.GEMINI_MODEL };
+export function requireGroqConfig(config: ReturnType<typeof loadConfig>) {
+  if (!config.GROQ_API_KEY) throw new Error('GROQ_API_KEY is required for Groq features.');
+  return { apiKey: config.GROQ_API_KEY, model: config.GROQ_MODEL };
 }

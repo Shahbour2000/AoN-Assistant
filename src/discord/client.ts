@@ -1,11 +1,15 @@
-import { Client, Events, GatewayIntentBits, MessageFlags, type ChatInputCommandInteraction, type Message } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, Events, GatewayIntentBits, MessageFlags, type ChatInputCommandInteraction, type Message } from 'discord.js';
 import type { AssistantService } from '../assistant/service.js';
-import { GeminiFailure } from '../gemini/client.js';
+import { AssistantRateLimitError } from '../assistant/service.js';
+import type { AonApiClient } from '../aon-api/client.js';
+import { analyzePlayer } from '../aon-api/analysis.js';
+import type { PlayerLinkService } from '../aon-api/linking.js';
+import { GroqFailure } from '../groq/client.js';
 import { logger } from '../logging/logger.js';
-import type { GuildSettingsRepository, TicketRepository } from '../database/repositories.js';
+import type { GuildSettingsRepository, LinkedPlayerRepository, TicketRepository } from '../database/repositories.js';
 import { TicketService, TICKET_CLOSE_ID, TICKET_OPEN_ID } from './tickets.js';
 
-export function createDiscordClient(assistant: AssistantService, settings: GuildSettingsRepository, tickets: TicketRepository): Client {
+export function createDiscordClient(assistant: AssistantService, settings: GuildSettingsRepository, tickets: TicketRepository, playerTools?: { api: AonApiClient; links: LinkedPlayerRepository; linking: PlayerLinkService }): Client {
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
   const ticketService = new TicketService(settings, tickets);
   const processed = new Set<string>();
@@ -21,22 +25,36 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
     const question = message.content.replace(new RegExp(`<@!?${client.user.id}>`, 'gu'), '').trim();
     if (!question) return;
     try {
-      const response = await assistant.ask({ guildId: message.guildId, userId: message.author.id, question, ...(ticket?.status === 'open' ? { conversationId: ticket.sessionId } : {}) });
+      const response = await assistant.ask({ guildId: message.guildId, userId: message.author.id, channelId: message.channelId, question, ...(ticket?.status === 'open' ? { conversationId: ticket.sessionId } : {}) });
       for (const part of splitDiscordMessage(response)) await message.reply({ content: part, allowedMentions: { repliedUser: false } });
     } catch (error) {
-      const failure = error instanceof GeminiFailure ? error.kind : 'request_failed';
-      logger.warn('Assistant message failed', { failure, guildId: message.guildId, userId: message.author.id });
-      const reply = failure === 'rate_limit' ? 'طلبات المساعد كثيرة حاليًا. حاول مرة أخرى بعد قليل.'
+      const failure = error instanceof AssistantRateLimitError ? 'rate_limit' : error instanceof GroqFailure ? error.kind : 'request_failed';
+      const original = error instanceof Error ? error : new Error(String(error));
+      logger.error('Assistant message failed', { stage: 'discord_ticket_message', failure, guildId: message.guildId, userId: message.author.id, channelId: message.channelId, httpStatus: error instanceof GroqFailure ? error.httpStatus : undefined, providerCode: error instanceof GroqFailure ? error.providerCode : undefined, providerDetails: error instanceof GroqFailure ? error.safeProviderDetails : undefined, retryAfterSeconds: error instanceof GroqFailure ? error.retryAfterSeconds : undefined, error: original.message, stack: original.stack, cause: original.cause instanceof Error ? original.cause.stack ?? original.cause.message : undefined });
+      const retryAfter = error instanceof AssistantRateLimitError ? error.retryAfterSeconds : error instanceof GroqFailure ? error.retryAfterSeconds : undefined;
+      const failureReply = failure === 'rate_limit' && retryAfter
+        ? `طلبات المساعد كثيرة حاليًا. جرّب تاني بعد ${retryAfter} ثانية.`
+        : failure === 'rate_limit' ? 'طلبات المساعد كثيرة حاليًا. حاول مرة أخرى بعد قليل.'
         : failure === 'timeout' || failure === 'unavailable' ? 'المساعد لا يستطيع الوصول إلى خدمة الإجابة الآن. حاول مرة أخرى بعد قليل.'
           : 'تعذر إكمال الإجابة الآن. حاول مرة أخرى لاحقًا.';
-      try { await message.reply({ content: reply, allowedMentions: { repliedUser: false } }); }
-      catch { logger.warn('Unable to send safe error reply', { guildId: message.guildId }); }
+      try { await message.reply({ content: failureReply, allowedMentions: { repliedUser: false } }); }
+      catch (replyError) { const sendFailure = replyError instanceof Error ? replyError : new Error(String(replyError)); logger.error('Unable to send assistant error reply', { stage: 'discord_error_reply', guildId: message.guildId, channelId: message.channelId, error: sendFailure.message, stack: sendFailure.stack }); }
     }
   });
   client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isButton()) {
       try {
-        if (interaction.customId === TICKET_OPEN_ID && interaction.guild) {
+        const linkAction = /^aon:link:(confirm|cancel):([\da-f-]+)$/u.exec(interaction.customId);
+        if (linkAction && playerTools) {
+          const [, action, token] = linkAction;
+          if (action === 'confirm') {
+            playerTools.linking.confirm(token!, interaction.user.id);
+            await interaction.update({ content: 'تم ربط الحساب. تنبيه: الربط لا يثبت ملكية حساب اللعبة.', components: [] });
+          } else {
+            playerTools.linking.cancel(token!, interaction.user.id);
+            await interaction.update({ content: 'تم إلغاء ربط الحساب.', components: [] });
+          }
+        } else if (interaction.customId === TICKET_OPEN_ID && interaction.guild) {
           const member = await interaction.guild.members.fetch(interaction.user.id);
           const channel = await ticketService.open(interaction.guild, member);
           await interaction.reply({ content: `Your ticket is ready: ${channel}`, ephemeral: true });
@@ -46,7 +64,10 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
           await interaction.reply({ content: 'Ticket closed.', ephemeral: true });
         }
       } catch (error) {
-        await interaction.reply({ content: error instanceof Error ? error.message : 'Could not complete the ticket action.', ephemeral: true }).catch(() => undefined);
+        const failure = error instanceof Error ? error : new Error(String(error));
+        const isLinkAction = interaction.customId.startsWith('aon:link:');
+        logger.error(isLinkAction ? 'Player link confirmation failed' : 'Ticket button interaction failed', { stage: isLinkAction ? 'player_link_confirmation' : interaction.customId === TICKET_OPEN_ID ? 'open_ticket_interaction' : 'close_ticket_interaction', guildId: interaction.guildId, channelId: interaction.channelId, userId: interaction.user.id, error: failure.message, stack: failure.stack });
+        await interaction.reply({ content: isLinkAction ? 'This link confirmation is invalid or expired. Run /link again.' : error instanceof Error ? error.message : 'Could not complete the ticket action.', ephemeral: true }).catch(() => undefined);
       }
       return;
     }
@@ -56,6 +77,16 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
       return;
     }
     if (interaction.commandName === 'ask') await handleAsk(interaction, assistant);
+    if (interaction.commandName === 'mentor') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const linked = playerTools?.links.getByDiscordUser(interaction.user.id);
+      const prompt = linked ? 'Give me my next concise Age of Nations mentor step. Prioritize missions and sustainable economy, use my current onboarding stage and avoid repeating completed checkpoints.' : 'Give me a concise first step for a new Age of Nations player, focusing on missions and sustainable economy.';
+      await interaction.editReply(await assistant.ask({ guildId: interaction.guildId ?? 'dm', userId: interaction.user.id, question: `${prompt}\n\n[mentor]` }));
+    }
+    if (playerTools && ['link', 'unlink', 'profile', 'stats', 'analyze', 'refresh'].includes(interaction.commandName)) {
+      await handlePlayerCommand(interaction, playerTools);
+      return;
+    }
     if (interaction.commandName === 'ticket') {
       const subcommand = interaction.options.getSubcommand();
       if (subcommand === 'configure') await ticketService.configure(interaction);
@@ -68,6 +99,56 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
   });
   return client;
 }
+
+async function handlePlayerCommand(interaction: ChatInputCommandInteraction, tools: { api: AonApiClient; links: LinkedPlayerRepository; linking: PlayerLinkService }): Promise<void> {
+  const command = interaction.commandName;
+  try {
+    if (command === 'link') {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const pending = await tools.linking.begin(interaction.user.id, interaction.options.getString('username', true));
+      const current = tools.links.getByDiscordUser(interaction.user.id);
+      if (current && current.playerId !== pending.player.id) throw new Error('UNLINK_BEFORE_CHANGING_ACCOUNT');
+      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(`aon:link:confirm:${pending.token}`).setLabel('Confirm link').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`aon:link:cancel:${pending.token}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      );
+      await interaction.editReply({ content: `Found **${safeDiscordText(pending.player.username)}** (ID: ${safeDiscordText(pending.player.id)}), level ${display(pending.player.level)}. Confirm to link. This confirms your selection only; account ownership is not verified.`, components: [row] });
+      return;
+    }
+    if (command === 'unlink') {
+      const removed = tools.links.unlink(interaction.user.id);
+      await interaction.reply({ content: removed ? 'Your player account was unlinked.' : 'No player account is linked.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const link = tools.links.getByDiscordUser(interaction.user.id);
+    if (!link) { await interaction.reply({ content: 'Link your game account first with /link.', flags: MessageFlags.Ephemeral }); return; }
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    const snapshot = command === 'refresh' ? await tools.api.refreshPlayer(link.playerId, link.username) : await tools.api.getSnapshot(link.playerId);
+    if (command === 'profile' || command === 'refresh') {
+      const p = snapshot.profile;
+      const rank = p.rank && typeof p.rank === 'object' ? (p.rank as { code?: unknown }).code : undefined;
+      await interaction.editReply({ content: `**${safeDiscordText(p.username)}** · Level ${display(p.level)} · ${safeDiscordText(rank ?? 'Rank unavailable')}\nCountry: ${safeDiscordText(p.countryId ?? 'Unavailable')} · Prestige: ${display(p.prestige)}\nFetched: ${snapshot.fetchedAt}\n_Linked, not ownership-verified._`, allowedMentions: { parse: [] } });
+    } else if (command === 'stats') {
+      const s = snapshot.stats;
+      await interaction.editReply({ content: `**${safeDiscordText(s.username)} — statistics**\nDamage: all ${display(s.damage?.all ?? s.damage?.total)}, week ${display(s.damage?.week)}, month ${display(s.damage?.month)}\nWork: all ${display(s.work?.all)}, week ${display(s.work?.week)}\nTrade: all ${display(s.trade?.all)}, week ${display(s.trade?.week)}\nCompanies: ${display(snapshot.companies.total ?? snapshot.companies.companies.length)}\nFetched: ${snapshot.fetchedAt}`, allowedMentions: { parse: [] } });
+    } else {
+      const a = analyzePlayer(snapshot);
+      await interaction.editReply({ content: `**${safeDiscordText(snapshot.profile.username)} — activity analysis**\nCurrent momentum: ${a.currentFocus}\n${a.explanation}\nHistorical specialization: ${a.historicalSpecialization}. ${a.historicalExplanation}\nFetched: ${snapshot.fetchedAt}`, allowedMentions: { parse: [] } });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Player API request failed';
+    logger.error('Player command failed', { stage: `player_${command}`, userId: interaction.user.id, error: message, stack: error instanceof Error ? error.stack : undefined });
+    const response = message === 'PLAYER_ALREADY_LINKED' ? 'That game account is already linked to another Discord user.'
+      : message === 'UNLINK_BEFORE_CHANGING_ACCOUNT' ? 'Unlink your current account first, then link the new account.'
+        : message === 'LINK_CONFIRMATION_EXPIRED' ? 'This confirmation expired or belongs to another user. Run /link again.'
+          : 'Could not retrieve player information right now. Please try again later.';
+    if (interaction.deferred || interaction.replied) await interaction.editReply(response);
+    else await interaction.reply({ content: response, flags: MessageFlags.Ephemeral });
+  }
+}
+
+function display(value: unknown): string { return value === undefined || value === null || value === '' ? 'unavailable' : String(value).slice(0, 100); }
+function safeDiscordText(value: unknown): string { return String(value).replace(/([\\`*_{}\[\]()<>#+\-.!|~])/gu, '\\$1').replace(/@/gu, '@\u200b').slice(0, 100); }
 
 export async function shouldHandleMessage(message: Pick<Message, 'guildId' | 'channelId' | 'mentions' | 'reference' | 'fetchReference'>, botId: string, ticketChannelId?: string): Promise<boolean> {
   if (!message.guildId) return false;
@@ -90,9 +171,14 @@ async function handleAsk(interaction: ChatInputCommandInteraction, assistant: As
     await interaction.editReply(parts[0]!);
     for (const part of parts.slice(1)) await interaction.followUp(part);
   } catch (error) {
-    const failure = error instanceof GeminiFailure ? error.kind : 'request_failed';
+    const failure = error instanceof AssistantRateLimitError ? 'rate_limit' : error instanceof GroqFailure ? error.kind : 'request_failed';
+    const original = error instanceof Error ? error : new Error(String(error));
+    logger.error('Slash ask failed', { stage: 'discord_slash_ask', failure, guildId, userId: interaction.user.id, httpStatus: error instanceof GroqFailure ? error.httpStatus : undefined, providerCode: error instanceof GroqFailure ? error.providerCode : undefined, retryAfterSeconds: error instanceof GroqFailure ? error.retryAfterSeconds : undefined, error: original.message, stack: original.stack });
     logger.warn('Assistant request failed', { failure, guildId, userId: interaction.user.id });
-    const message = failure === 'rate_limit'
+    const retryAfter = error instanceof AssistantRateLimitError ? error.retryAfterSeconds : error instanceof GroqFailure ? error.retryAfterSeconds : undefined;
+    const message = failure === 'rate_limit' && retryAfter
+      ? `طلبات المساعد كثيرة حاليًا. جرّب تاني بعد ${retryAfter} ثانية.`
+      : failure === 'rate_limit'
       ? 'طلبات المساعد كثيرة حاليًا. حاول مرة أخرى بعد قليل.'
       : failure === 'timeout' || failure === 'unavailable'
         ? 'المساعد لا يستطيع الوصول إلى خدمة الإجابة الآن. حاول مرة أخرى بعد قليل.'

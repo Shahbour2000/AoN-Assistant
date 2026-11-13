@@ -32,6 +32,24 @@ const migrations: Migration[] = [
   );
   CREATE UNIQUE INDEX one_open_ticket_per_owner ON tickets(guild_id, owner_id) WHERE status = 'open';
   CREATE INDEX tickets_guild_status_idx ON tickets(guild_id, status);` },
+  { version: 3, sql: `CREATE TABLE linked_players (
+    discord_user_id TEXT PRIMARY KEY,
+    player_id TEXT NOT NULL UNIQUE,
+    username TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0, 1))
+  );
+  CREATE INDEX linked_players_player_id_idx ON linked_players(player_id);` },
+  { version: 4, sql: `CREATE TABLE onboarding_state (
+    player_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, stage TEXT NOT NULL DEFAULT 'new-player',
+    initial_guidance_at TEXT, last_interaction_at TEXT, checkpoints TEXT NOT NULL DEFAULT '[]'
+  );` },
+  { version: 5, sql: `CREATE TABLE assistant_context (
+    context_key TEXT PRIMARY KEY, selected_player_id TEXT, selected_player_name TEXT,
+    selected_fetched_at TEXT, waiting_for_username INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX assistant_context_updated_idx ON assistant_context(updated_at);` },
 ];
 
 export function runMigrations(db: Database.Database): void {
