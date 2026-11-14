@@ -50,6 +50,10 @@ const migrations: Migration[] = [
     updated_at TEXT NOT NULL
   );
   CREATE INDEX assistant_context_updated_idx ON assistant_context(updated_at);` },
+  { version: 6, sql: `CREATE TABLE conversation_summaries (
+    session_id TEXT PRIMARY KEY, summary TEXT NOT NULL, through_ordinal INTEGER NOT NULL, updated_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+  );` },
 ];
 
 export function runMigrations(db: Database.Database): void {

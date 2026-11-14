@@ -45,6 +45,11 @@ export class AonApiClient {
   getPlayer(playerId: string): Promise<AonPlayer> { return this.get(`/players/${validateId(playerId)}`, playerSchema); }
   getStats(playerId: string): Promise<AonStats> { return this.get(`/players/${validateId(playerId)}/stats`, statsSchema); }
   getCompanies(playerId: string): Promise<AonCompanyList> { return this.get(`/players/${validateId(playerId)}/companies?limit=50&sort=invested`, companiesSchema); }
+  /** Read-only generic GET used by the agent tools. Only known read endpoints are allowed; caching, dedupe, rate limits and timeouts still apply. */
+  getJson(path: string): Promise<AonEntityData> {
+    if (!/^\/(players|countries|companies|market|rankings|wars|battles|search|game|regions|units|parties|alliances)(\/|\?|$)/u.test(path) || path.includes('..') || path.length > 300) throw new Error('Unsupported API path');
+    return this.get(path, openApiDataSchema);
+  }
   searchEntities(query: string): Promise<AonEntityData> { const q = query.trim(); if (q.length < 2 || q.length > 60) throw new Error('Search query must be 2–60 characters'); return this.get(`/search?q=${encodeURIComponent(q)}`, openApiDataSchema); }
   getCountrySummary(countryId: string): Promise<AonEntityData> { return this.get(`/countries/${validateId(countryId)}/summary`, openApiDataSchema); }
   getCountryCitizens(countryId: string): Promise<AonEntityData> { return this.get(`/countries/${validateId(countryId)}/citizens`, openApiDataSchema); }

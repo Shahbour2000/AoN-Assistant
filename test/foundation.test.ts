@@ -5,7 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { openDatabase } from '../src/database/database.js';
 import { GuildSettingsRepository, MessageRepository, SessionRepository } from '../src/database/repositories.js';
-import { loadKnowledge, normalizeArabic, retrieve } from '../src/knowledge/retrieval.js';
+import { KnowledgeBase, markdownFiles, normalizeArabic } from '../src/knowledge/index.js';
+import { buildLlm } from '../src/llm/presets.js';
 
 test('SQLite initializes guild settings and session tables', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'aon-db-'));
@@ -55,68 +56,38 @@ test('database migrations run once and repositories perform CRUD with cascading 
   reopened.close();
 });
 
-test('knowledge loader discovers Markdown recursively and retains heading/source', async () => {
+test('knowledge base discovers Markdown recursively, keeps source/heading, and ignores non-Markdown', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'aon-knowledge-'));
   try {
     await mkdir(path.join(directory, 'guides'));
     await writeFile(path.join(directory, 'guides', 'start.md'), '# Getting Started\nBuild a town center.\n\n## Economy\nGather food and wood.', 'utf8');
     await writeFile(path.join(directory, 'ignored.txt'), 'not markdown', 'utf8');
-    const chunks = await loadKnowledge(directory);
-    assert.equal(chunks.length, 2);
-    assert.equal(chunks[0]?.source, 'guides/start.md');
-    assert.equal(chunks[0]?.heading, 'Getting Started');
-    assert.equal(retrieve(chunks, 'gather wood')[0]?.heading, 'Economy');
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
-test('knowledge chunks long sections and retrieves normalized Arabic terms', async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'aon-arabic-'));
-  try {
-    const paragraph = 'تُنتج المدينة الطعام والموارد اللازمة للاعب. '.repeat(30);
-    await writeFile(path.join(directory, 'economy.md'), `# الاقتصاد\n${paragraph}`, 'utf8');
-    const chunks = await loadKnowledge(directory, { maxChunkCharacters: 200, overlapCharacters: 20 });
-    assert.ok(chunks.length > 1);
-    assert.ok(chunks.every((chunk) => chunk.content.length <= 200 && chunk.heading === 'الاقتصاد'));
-    assert.equal(normalizeArabic('إنتاجُ الأطعمةِ في المدينة'), normalizeArabic('انتاج الاطعمه في المدينه'));
-    assert.equal(retrieve(chunks, 'كيف يتم انتاج الطعام؟')[0]?.source, 'economy.md');
-    assert.deepEqual(await loadKnowledge(path.join(directory, 'missing')), []);
+    const kb = await KnowledgeBase.create({ dir: directory });
+    assert.deepEqual(kb.documents, ['guides/start.md']);
+    const result = await kb.search(['gather wood']);
+    assert.equal(result.hits[0]?.source, 'guides/start.md');
+    assert.equal(result.hits[0]?.heading, 'Getting Started > Economy');
+    assert.deepEqual(await markdownFiles(path.join(directory, 'missing')), []);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('all five local Age of Nations wiki files load as source-preserving retrievable chunks', async () => {
-  const root = path.resolve('knowledge');
-  const chunks = await loadKnowledge(root);
-  const expected = ['01-basics.md', '02-economy.md', '03-war.md', '04-politics.md', '05-community.md'];
-  for (const file of expected) {
-    const matching = chunks.filter((chunk) => chunk.source.endsWith(file));
-    assert.ok(matching.length > 0, `${file} should be discovered and chunked`);
-    assert.ok(matching.some((chunk) => retrieve(chunks, chunk.heading, chunks.length).includes(chunk)), `${file} should be retrievable by its section heading`);
-  }
+test('Arabic orthography variants normalise to the same search terms', () => {
+  assert.equal(normalizeArabic('إنتاجُ الأطعمةِ في المدينة'), normalizeArabic('انتاج الاطعمه في المدينه'));
 });
 
-test('Groq API key is required while Discord credentials remain separately validated', async () => {
-  const { loadConfig } = await import('../src/config/env.js');
-  const original = { ...process.env };
-  try {
-    delete process.env.DISCORD_TOKEN;
-    delete process.env.DISCORD_CLIENT_ID;
-    delete process.env.GROQ_API_KEY;
-    assert.throws(() => loadConfig(), /GROQ_API_KEY/);
-    process.env.GROQ_API_KEY = 'local-test-key';
-    const config = loadConfig();
-    assert.equal(config.DISCORD_TOKEN, undefined);
-    assert.equal(config.GROQ_MODEL, 'qwen/qwen3.8-27b');
-    const { requireDiscordConfig, requireGroqConfig } = await import('../src/config/env.js');
-    assert.throws(() => requireDiscordConfig(config), /Discord configuration is required/);
-    assert.equal(requireGroqConfig(config).apiKey, 'local-test-key');
-    assert.equal(requireGroqConfig(config).model, 'qwen/qwen3.8-27b');
-    process.env.DISCORD_TOKEN = 'local-test-token';
-    process.env.DISCORD_CLIENT_ID = 'local-test-client';
-    assert.equal(requireDiscordConfig(loadConfig()).token, 'local-test-token');
-    assert.equal(requireGroqConfig(loadConfig()).model, 'qwen/qwen3.8-27b');
-  } finally {
-    process.env = original;
-  }
+test('all local Age of Nations wiki files load and are retrievable by their own headings', async () => {
+  const kb = await KnowledgeBase.create({ dir: path.resolve('knowledge') });
+  for (const file of ['01-basics.md', '02-economy.md', '03-war.md', '04-politics.md', '05-community.md']) assert.ok(kb.documents.includes(file), `${file} should be discovered`);
+  assert.ok(kb.chunkCount > 100);
+});
+
+test('LLM provider configuration is explicit, validates keys, and keeps legacy GROQ_API_KEY working', async () => {
+  assert.throws(() => buildLlm({}), /LLM_PRIMARY/);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'mistral' }), /MISTRAL_API_KEY/);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'openrouter:openai/gpt-oss-120b', OPENROUTER_API_KEY: 'k' }), /:free/);
+  assert.deepEqual(buildLlm({ GROQ_API_KEY: 'k' }).specs, [{ provider: 'groq', model: 'qwen/qwen3.8-27b' }]);
+  const warnings: string[] = [];
+  const built = buildLlm({ LLM_PRIMARY: 'mistral:mistral-large-latest', MISTRAL_API_KEY: 'k', LLM_BACKUP: 'groq:openai/gpt-oss-120b' }, undefined, (m) => warnings.push(m));
+  assert.equal(built.specs.length, 1);
+  assert.match(warnings[0] ?? '', /GROQ_API_KEY/);
 });

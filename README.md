@@ -1,79 +1,69 @@
 # AoN Assistant
 
-Standalone Discord assistant for Age of Nations. The project targets Node.js 22+, TypeScript, Discord.js, Groq's OpenAI-compatible API, and SQLite.
+A Discord assistant for the browser strategy game **Age of Nations**. It is a general conversational AI (Egyptian Arabic, Modern Standard Arabic, English) that also knows the game: mechanics come only from the Markdown wiki in `knowledge/`, live facts come only from the real game API.
 
-## Current phase
+## How it works
 
-The runnable bot provides `/ping`, `/ask`, private support tickets, and Groq responses grounded in locally retrieved Markdown. Optional AoN account linking adds public profile/statistics context to answers; account links are not proof of ownership.
+```
+Discord message
+  → AssistantService  (per-user/channel memory, active-player context, request gate)
+  → Agent loop        (the model decides: answer directly, search the wiki, call game-API tools, calculate)
+       ├─ search_knowledge → hybrid RAG: heading-aware chunks, BM25 (Arabic-normalised + stemmed) + embeddings, rank fusion
+       ├─ game tools       → find_player, get_player_data, search_game, get_country, get_market, get_rankings, get_wars (read-only AoN API)
+       └─ calculate        → exact arithmetic on game numbers
+  → Validator         (numbers must appear in tool evidence; API failure ≠ "not found"; no tool-syntax leaks; language match) + one revision pass
+  → Reply in the player's language
+```
+
+- **No keyword routing.** Whether to search the wiki, call the API or just chat is decided by the model from the conversation; tool results always go back to the model.
+- **Knowledge:** drop `.md` files anywhere under `knowledge/` (see `knowledge/README.md`); they are indexed automatically. Embeddings are cached in `data/embeddings.json` by content hash, so only new/changed passages are embedded. If embeddings are unavailable the search degrades to keyword-only and says so in the logs.
+- **Game API:** `https://app.ageofnations.world/api/v1`, read-only, no key. Cached 30 s, deduplicated, paced below 60 requests/min. Statuses: `not_found` only for a real 404; timeouts/429/malformed → "temporarily unavailable", never "doesn't exist".
+- **Memory:** recent whole messages within a token budget plus a rolling summary of older turns, isolated per guild+user+channel. No cross-user leakage.
+- **Cost safety:** only free-tier providers are configured; the local limiter mirrors each free-tier limit; failover goes only to providers you list in `LLM_BACKUP`; there is no automatic switch to a paid plan or model.
 
 ## Setup
 
-1. Install Node.js 22 or newer and npm.
-2. Run `npm install`.
-3. Copy `.env.example` to `.env` and configure the Discord and Groq values below. Tests use mocked provider calls and need no real credentials.
-4. Add trusted `.md` files under `knowledge/`.
-5. Run `npm run typecheck`, then `npm run dev`.
+1. Node.js 22+ and npm. `npm install`.
+2. `cp .env.example .env`, fill in Discord values and at least one LLM key (Mistral recommended; see below).
+3. Put game Markdown in `knowledge/` (the five bundled wiki files plus `00-glossary.md` are included).
+4. `npm run typecheck`, then `npm run dev` (or `npm run build && npm start`).
+5. In Discord use `/ping`, `/ask`, or talk in the configured assistant channel.
 
-The bundled knowledge set includes `01-basics.md`, `02-economy.md`, `03-war.md`, `04-politics.md`, and `05-community.md`. Startup discovers all Markdown files recursively; retrieval ranks chunks from the combined set for each question.
+## Choosing a free model provider (researched Nov 2026; limits change — verify in each console)
+
+| Provider (free tier) | Default model | Strengths | Caveats |
+| --- | --- | --- | --- |
+| **Mistral** (Experiment plan) — recommended primary | `mistral-large-latest` | Strong Arabic and tool calling, generous limits (~tens of requests/min, large token budget) | Free-tier inputs may be used for training: don't send private data |
+| **Gemini** (AI Studio, no billing) — backup + embeddings | `gemini-3.1-flash-lite` / `gemini-embedding-001` | Very capable, good multilingual embeddings | Small daily request cap; data terms differ on free tier; use a key from a non-billing project |
+| **Groq** — backup | `qwen/qwen3.8-27b` (preview) | Very fast | 8K tokens/min free limit starves RAG answers; preview model |
+| **OpenRouter** — emergency only | `openai/gpt-oss-120b:free` | Many models | ~50 requests/day on `:free`; only `:free` ids accepted |
+| Cerebras | — | — | Not free for this use; not wired |
+
+Intelligence was prioritised over raw limits. Change `LLM_PRIMARY` / `LLM_BACKUP` / keys / models in `.env` without touching code.
 
 ## Environment variables
 
-| Variable | Purpose |
-| --- | --- |
-| `DISCORD_TOKEN` | Discord bot token |
-| `DISCORD_CLIENT_ID` | Discord application/client ID used to register slash commands |
-| `GROQ_API_KEY` | Required GroqCloud API key |
-| `GROQ_MODEL` | Groq model (defaults to `qwen/qwen3.8-27b`) |
-| `DATABASE_PATH` | SQLite database file path |
-| `KNOWLEDGE_DIR` | Markdown knowledge directory |
-| `LOG_LEVEL` | `debug`, `info`, `warn`, or `error` |
-
-Keep `.env` private. Never commit bot tokens or API keys. Knowledge Markdown files are ignored by Git; `knowledge/README.md` is tracked.
-
-The AoN public API uses `https://app.ageofnations.world/api/v1` and needs no key or additional environment variable. Responses are cached locally for 30 seconds and calls are paced below its documented 60 requests/minute/IP limit.
+See `.env.example` for the annotated list: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `MISTRAL_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
 
 ## Commands
 
-- `npm run dev` — run the startup check in watch mode.
-- `npm run build` — compile to `dist/`.
-- `npm start` — run the compiled startup check.
-- `npm run typecheck` — validate TypeScript without emitting files.
-- `npm test` — run foundation, API, account-linking, analysis, and integration tests with mocked external requests.
-
-## Run the bot
-
-1. Create a Discord application and bot in the Discord Developer Portal.
-2. Invite it to your server with the `bot` and `applications.commands` scopes and permission to view/send messages.
-3. Create a GroqCloud API key and set `GROQ_API_KEY` in `.env`; never commit that file.
-4. Add game Markdown sources under `knowledge/`.
-5. Run `npm run dev` for development or `npm run build && npm start` for compiled execution.
-6. Use `/ping` to check availability and `/ask question:<your question>` to ask about the game.
+- `npm run dev` / `npm run build` / `npm start` — run, compile, run compiled.
+- `npm run typecheck` — source plus tests and eval.
+- `npm test` — offline test suites (all external services mocked: scripted model, fake HTTP, in-memory DB). **These do not prove live model quality.**
+- `npm run eval [filter]` — **live** evaluation against the real model provider and the real AoN API (`eval/scenarios.ts`: general chat, beginner help, Egyptian Arabic, hallucination traps, API tools, simulated API faults). Consumes free-tier quota; needs keys and internet. Scenarios with a REVIEW note need a human to read the answer.
 
 ## Player accounts and personalized answers
 
 - `/link username:<in-game name>` looks up the public player profile and asks you to confirm it. Confirmation records your Discord ID and the stable AoN player ID. It does **not** verify that you own that game account.
 - `/unlink` removes your association. To change accounts, unlink first and then run `/link` again.
 - `/profile`, `/stats`, and `/analyze` show public API data and a preliminary activity classification. `/refresh` clears the local snapshot cache and fetches fresh data.
-- When a linked user asks a question, the assistant includes a bounded profile/statistics summary alongside relevant Markdown chunks. Missing or unavailable API data is disclosed; game mechanics remain grounded in the Markdown knowledge base.
+- Linking is optional. A linked account is only a default for "my account" questions; any player can be looked up by simply naming them in the conversation. The active player is remembered temporarily (2 hours) and only inside that private conversation.
 - `/analyze` reports current momentum by comparing each category’s weekly amount with its own 30-day total, normalized to a weekly pace. The dimensionless indices are compared with a 25% relative margin; missing, zero, malformed, or inconsistent windows produce “insufficient data.” This is a recent-momentum heuristic, not a judgment of player quality.
 - Historical specialization remains “insufficient data”: the API reports lifetime damage in damage points and work/trade as counts, with no validated common scale or comparison cohort. The bot does not compare those raw units or infer a lifetime specialty from them.
 - The public API has no account-ownership verification flow. Do not treat link confirmation as ownership proof. Public profile and company fields can be absent; timestamps indicate when the snapshot was fetched.
 
 Automated tests mock all external API calls. No AoN API key is required, and the app does not poll the API.
 
-## Current modules
+## Source layout
 
-- `src/config/env.ts` validates shared settings and requires a Groq API key when starting the bot.
-- `src/database/migrations.ts` applies versioned, transactional schema migrations. `src/database/repositories.ts` provides settings, session, and message CRUD.
-- `src/knowledge/retrieval.ts` discovers Markdown recursively, preserves relative source and heading, splits oversized sections, normalizes Arabic text, and ranks matching chunks with a simple lexical score. It is a lightweight local retriever, not embedding-based RAG.
-- `src/assistant/service.ts` retrieves relevant chunks, loads recent messages scoped to the guild and user, calls the answer provider, and persists the exchange.
-- `src/discord/commands.ts` registers global `/ping` and `/ask`; `src/discord/client.ts` handles them, defers long requests, and splits long responses under Discord's message limit.
-- `src/groq/client.ts` sends OpenAI-compatible chat completions to Groq's API, caps retrieved context and output, and classifies provider failures without retry loops.
-- `src/aon-api/client.ts` validates the public profile, statistics, and company fields used by the app; applies 30-second caching, request deduplication, a conservative local request pace, timeout, and bounded 429 retry handling.
-- `src/aon-api/linking.ts` handles time-limited player-link confirmation, link conflicts, and unverified associations. `src/aon-api/analysis.ts` builds bounded player context and keeps classification logic separate.
-- Migration 3 creates `linked_players`; it runs automatically without discarding existing database data.
-
-The selected Qwen model's published free-plan limits are currently 30 requests/minute, 1,000 requests/day, 8,000 tokens/minute, and 200,000 tokens/day. Limits can vary by account and may change; check the Groq console. The app sends at most four retrieved chunks, trims recent history, caps completions at 800 tokens, honors `Retry-After` in its user-facing response, and makes no automatic retries or paid-model fallback.
-
-Put trusted Markdown files in `knowledge/`; the `.gitignore` rule prevents those files from being committed accidentally. Answers are instructed to rely on retrieved source material and acknowledge when it is insufficient. Retrieval is lightweight lexical matching, so verify knowledge coverage and answer quality before relying on it for authoritative game guidance.
-
+`src/llm` provider layer (OpenAI-compatible provider, limiter, failover, presets) · `src/knowledge` chunker, BM25, vector store, hybrid search · `src/agent` loop, tools, validator, memory, prompt · `src/assistant/service.ts` orchestration · `src/aon-api` API client, linking, analysis · `src/discord` Discord glue · `src/database` SQLite migrations/repositories · `test/` offline suites · `eval/` live evaluation.

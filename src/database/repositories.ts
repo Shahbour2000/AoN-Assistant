@@ -74,7 +74,7 @@ export class MessageRepository {
     const rows = this.db.prepare('SELECT * FROM (SELECT * FROM conversation_messages WHERE session_id = ? ORDER BY ordinal DESC LIMIT ?) ORDER BY ordinal').all(sessionId, limit) as Record<string, unknown>[];
     return rows.map((row) => ({ sessionId: String(row.session_id), ordinal: Number(row.ordinal), role: row.role as ConversationMessage['role'], content: String(row.content), createdAt: String(row.created_at) }));
   }
-  deleteForSession(sessionId: string): number { return this.db.prepare('DELETE FROM conversation_messages WHERE session_id = ?').run(sessionId).changes; }
+  deleteForSession(sessionId: string): number { this.db.prepare('DELETE FROM conversation_summaries WHERE session_id = ?').run(sessionId); return this.db.prepare('DELETE FROM conversation_messages WHERE session_id = ?').run(sessionId).changes; }
   appendForUser(message: UserConversationMessage): ConversationMessage {
     const sessionId = `user:${message.guildId}:${message.userId}`;
     return this.db.transaction(() => {
@@ -95,6 +95,24 @@ export class MessageRepository {
       this.db.prepare('UPDATE sessions SET last_activity_at = ? WHERE id = ?').run(message.createdAt, id);
       return stored;
     })();
+  }
+  /** Session id used for a conversation, or undefined when nothing has been stored yet. Mirrors listForScope/listForUser. */
+  findSessionId(guildId: string, userId: string, channelId?: string): string | undefined {
+    if (channelId !== undefined) { const id = `scope:${guildId}:${channelId}:${userId}`; return this.db.prepare('SELECT id FROM sessions WHERE id = ?').get(id) ? id : undefined; }
+    return (this.db.prepare('SELECT id FROM sessions WHERE guild_id = ? AND user_id = ?').get(guildId, userId) as { id: string } | undefined)?.id;
+  }
+  /** Messages after `afterOrdinal` (exclusive), oldest first. */
+  listAfter(sessionId: string, afterOrdinal: number, limit = 200): ConversationMessage[] {
+    const rows = this.db.prepare('SELECT * FROM (SELECT * FROM conversation_messages WHERE session_id = ? AND ordinal > ? ORDER BY ordinal DESC LIMIT ?) ORDER BY ordinal').all(sessionId, afterOrdinal, limit) as Record<string, unknown>[];
+    return rows.map((row) => ({ sessionId: String(row.session_id), ordinal: Number(row.ordinal), role: row.role as ConversationMessage['role'], content: String(row.content), createdAt: String(row.created_at) }));
+  }
+  getSummary(sessionId: string): { summary: string; throughOrdinal: number } | undefined {
+    const row = this.db.prepare('SELECT summary, through_ordinal FROM conversation_summaries WHERE session_id = ?').get(sessionId) as { summary: string; through_ordinal: number } | undefined;
+    return row ? { summary: row.summary, throughOrdinal: row.through_ordinal } : undefined;
+  }
+  setSummary(sessionId: string, summary: string, throughOrdinal: number, at = new Date().toISOString()): void {
+    this.db.prepare(`INSERT INTO conversation_summaries (session_id, summary, through_ordinal, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary, through_ordinal = excluded.through_ordinal, updated_at = excluded.updated_at`).run(sessionId, summary, throughOrdinal, at);
   }
   listForScope(guildId: string, channelId: string, userId: string, limit = 20): ConversationMessage[] {
     const id = `scope:${guildId}:${channelId}:${userId}`;

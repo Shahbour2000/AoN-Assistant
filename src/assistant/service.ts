@@ -1,15 +1,13 @@
-import type { MessageRepository } from '../database/repositories.js';
-import type { AnswerProvider } from '../groq/client.js';
-import type { KnowledgeChunk } from '../knowledge/retrieval.js';
+import type { LinkedPlayerRepository, MessageRepository } from '../database/repositories.js';
+import { runAgent, type AgentOutcome } from '../agent/loop.js';
+import { ConversationMemory } from '../agent/memory.js';
+import { buildSystemPrompt } from '../agent/prompt.js';
+import { createTools, type ActivePlayer, type GameApi, type ToolContext } from '../agent/tools/index.js';
+import type { KnowledgeBase } from '../knowledge/index.js';
+import type { LlmProvider } from '../llm/types.js';
 import { logger } from '../logging/logger.js';
-import type { LinkedPlayerRepository } from '../database/repositories.js';
-import { AonApiClient } from '../aon-api/client.js';
-import { createAgentTools, type PlayerSelection } from './tools.js';
-import { selectOnboardingStage, mentorBrief } from '../aon-api/onboarding.js';
-import type { PlayerSnapshot } from '../aon-api/client.js';
 
 export interface AskInput { guildId: string; userId: string; question: string; conversationId?: string; channelId?: string; }
-interface PlayerConversationState { selectedId?: string; username?: string; fetchedAt?: string; waitingForUsername: boolean; lastLookup?: 'found' | 'not_found' | 'unavailable'; }
 export class AssistantRateLimitError extends Error { constructor(readonly retryAfterSeconds: number) { super('Assistant application request limit reached'); this.name = 'AssistantRateLimitError'; } }
 export class AssistantRequestGate {
   private readonly userTimes = new Map<string, number[]>();
@@ -25,53 +23,72 @@ export class AssistantRequestGate {
   }
 }
 
+export interface AssistantDeps {
+  llm: LlmProvider;
+  messages: MessageRepository;
+  knowledge?: KnowledgeBase | undefined;
+  api?: GameApi | undefined;
+  links?: LinkedPlayerRepository | undefined;
+  validation?: 'off' | 'basic' | 'llm';
+  requestGate?: AssistantRequestGate;
+  now?: () => Date;
+}
+
+const ACTIVE_PLAYER_TTL_MS = 2 * 3_600_000;
+const UNVERIFIED_NOTE = (arabic: boolean) => arabic ? '\n\n_ملاحظة: مقدرتش أتأكد من بعض الأرقام دي من مصادري، فاعتبرها تقريبية._' : '\n\n_Note: I could not verify some of the figures above against my sources, so treat them as approximate._';
+
 export class AssistantService {
-  constructor(private readonly provider: AnswerProvider, private readonly messages: MessageRepository, private readonly chunks: KnowledgeChunk[], private readonly players?: { links: LinkedPlayerRepository; api: AonApiClient }, private readonly apiReference?: string, private readonly requestGate = new AssistantRequestGate()) {}
-  async ask(input: AskInput): Promise<string> {
-    let stage = 'knowledge_retrieval';
-    try {
-      this.requestGate.admit(JSON.stringify([input.guildId, input.userId]));
-      stage = 'load_conversation_history';
-      const scopeId = JSON.stringify([input.guildId, input.channelId ?? 'default', input.conversationId ?? null, input.userId]);
-      const historyScope = JSON.stringify([input.channelId ?? 'default', input.conversationId ?? null]);
-      const history = input.channelId ? this.messages.listForScope(input.guildId, historyScope, input.userId, 20) : this.messages.listForUser(input.guildId, input.userId, 20);
-      const storedState = this.messages.getAssistantContext(scopeId);
-      const state: PlayerConversationState = { ...(storedState?.selectedPlayerId ? { selectedId: storedState.selectedPlayerId } : {}), ...(storedState?.selectedPlayerName ? { username: storedState.selectedPlayerName } : {}), ...(storedState?.selectedFetchedAt ? { fetchedAt: storedState.selectedFetchedAt } : {}), waitingForUsername: storedState?.waitingForUsername ?? false };
-      const linked = this.players?.links.getByDiscordUser(input.userId);
-      const selected: PlayerSelection | undefined = state.selectedId && state.username ? { id: state.selectedId, username: state.username, fetchedAt: state.fetchedAt ?? '' }
-        : linked ? { id: linked.playerId, username: linked.username, fetchedAt: linked.linkedAt } : undefined;
-      const tools = createAgentTools({ chunks: this.chunks, ...(this.players ? { api: this.players.api } : {}), selected,
-        setSelected: (player) => { state.selectedId = player.id; state.username = player.username; state.fetchedAt = player.fetchedAt; state.waitingForUsername = false; state.lastLookup = 'found'; this.messages.setAssistantContext(scopeId, { selectedPlayerId: player.id, selectedPlayerName: player.username, selectedFetchedAt: player.fetchedAt, waitingForUsername: false, updatedAt: new Date().toISOString() }); },
-        setWaitingForUsername: () => { state.waitingForUsername = true; this.messages.setAssistantContext(scopeId, { ...(state.selectedId ? { selectedPlayerId: state.selectedId } : {}), ...(state.username ? { selectedPlayerName: state.username } : {}), ...(state.fetchedAt ? { selectedFetchedAt: state.fetchedAt } : {}), waitingForUsername: true, updatedAt: new Date().toISOString() }); },
-        onPlayerSnapshot: (playerId, snapshot: PlayerSnapshot) => {
-          if (linked?.playerId !== playerId) return undefined;
-          const stage = selectOnboardingStage(snapshot);
-          this.players!.links.updateOnboarding(playerId, stage);
-          return { stage, state: this.players!.links.getOnboarding(playerId), mentorBrief };
-        }, ...(this.apiReference ? { apiReference: this.apiReference } : {}) });
-      const playerContext = selected || state.waitingForUsername ? JSON.stringify({ selectedPlayer: selected?.username, selectedFetchedAt: selected?.fetchedAt, waitingForUsername: state.waitingForUsername, lastLookup: state.lastLookup ?? (selected ? 'legacy-link' : undefined), source: 'temporary conversation selection' }) : undefined;
-      stage = 'provider_generation';
-      const answer = await this.provider.answer({ question: input.question, context: [], history, ...(playerContext ? { playerContext } : {}), tools });
-      if (state.selectedId || state.waitingForUsername) this.messages.setAssistantContext(scopeId, { ...(state.selectedId ? { selectedPlayerId: state.selectedId } : {}), ...(state.username ? { selectedPlayerName: state.username } : {}), ...(state.fetchedAt ? { selectedFetchedAt: state.fetchedAt } : {}), waitingForUsername: state.waitingForUsername, updatedAt: new Date().toISOString() });
-      return this.persistAnswer(input, history, answer);
-    } catch (error) {
-      const failure = error instanceof Error ? error : new Error(String(error));
-      logger.error('Assistant pipeline failed', { stage, guildId: input.guildId, userId: input.userId, conversationId: input.conversationId, error: failure.message, stack: failure.stack, cause: failure.cause instanceof Error ? failure.cause.stack ?? failure.cause.message : undefined });
-      throw error;
-    }
+  private readonly memory: ConversationMemory;
+  private readonly gate: AssistantRequestGate;
+  constructor(private readonly deps: AssistantDeps) {
+    this.memory = new ConversationMemory(deps.messages);
+    this.gate = deps.requestGate ?? new AssistantRequestGate();
   }
 
-  private persistAnswer(input: AskInput, history: { role: 'user' | 'model'; content: string }[], answer: string): string {
-    const now = new Date().toISOString();
-    if (input.channelId) {
-      const historyScope = JSON.stringify([input.channelId, input.conversationId ?? null]);
-      this.messages.appendForScope({ guildId: input.guildId, userId: input.userId, role: 'user', content: input.question, createdAt: now }, historyScope);
-      this.messages.appendForScope({ guildId: input.guildId, userId: input.userId, role: 'model', content: answer, createdAt: now }, historyScope);
-    } else {
-        this.messages.appendForUser({ guildId: input.guildId, userId: input.userId, role: 'user', content: input.question, createdAt: now });
-        this.messages.appendForUser({ guildId: input.guildId, userId: input.userId, role: 'model', content: answer, createdAt: now });
+  async ask(input: AskInput): Promise<string> {
+    this.gate.admit(JSON.stringify([input.guildId, input.userId]));
+    const { messages, knowledge, api, llm } = this.deps;
+    const scopeId = JSON.stringify([input.guildId, input.channelId ?? 'default', input.conversationId ?? null, input.userId]);
+    const historyScope = input.channelId ? JSON.stringify([input.channelId, input.conversationId ?? null]) : undefined;
+    const memory = this.memory.load(input.guildId, input.userId, historyScope);
+
+    // Temporary, per-conversation player context (expires); a linked account is only a convenience default.
+    let active: ActivePlayer | undefined;
+    const stored = messages.getAssistantContext(scopeId);
+    if (stored?.selectedPlayerId && stored.selectedPlayerName && Date.now() - Date.parse(stored.updatedAt) < ACTIVE_PLAYER_TTL_MS) active = { id: stored.selectedPlayerId, username: stored.selectedPlayerName, fetchedAt: stored.selectedFetchedAt ?? stored.updatedAt };
+    else { const linked = this.deps.links?.getByDiscordUser(input.userId); if (linked) active = { id: linked.playerId, username: linked.username, fetchedAt: linked.linkedAt }; }
+
+    const toolContext: ToolContext = {
+      knowledge, api,
+      getActivePlayer: () => active,
+      setActivePlayer: (player) => { active = player; messages.setAssistantContext(scopeId, { selectedPlayerId: player.id, selectedPlayerName: player.username, selectedFetchedAt: player.fetchedAt, waitingForUsername: false, updatedAt: new Date().toISOString() }); },
+      now: () => Date.now(),
+    };
+    const tools = createTools({ knowledge, api });
+    const system = buildSystemPrompt({ now: this.deps.now?.() ?? new Date(), knowledgeOutline: knowledge?.outline(), hasKnowledge: Boolean(knowledge), hasGameApi: Boolean(api), summary: memory.summary, activePlayer: active });
+
+    let outcome: AgentOutcome;
+    try {
+      outcome = await runAgent({ llm, tools, toolContext, validation: this.deps.validation ?? 'basic' }, { system, history: memory.messages, userMessage: input.question });
+    } catch (error) {
+      logger.error('Assistant pipeline failed', { guildId: input.guildId, userId: input.userId, conversationId: input.conversationId, error: error instanceof Error ? error.message : String(error) });
+      throw error;
     }
-    void history;
+
+    let answer = outcome.answer;
+    if (outcome.unresolvedIssues.some((issue) => issue.code === 'ungrounded_numbers' || issue.code === 'unsupported_claims')) answer += UNVERIFIED_NOTE(/[؀-ۿ]/u.test(input.question));
+    logger.info('Assistant answered', { guildId: input.guildId, userId: input.userId, provider: outcome.provider, llmCalls: outcome.llmCalls, revisions: outcome.revisions, tools: outcome.trace.map((t) => `${t.tool}:${t.status}`), unresolved: outcome.unresolvedIssues.map((i) => i.code) });
+    const sessionId = this.persist(input, historyScope, answer);
+    void this.memory.maybeSummarise(sessionId, llm);
     return answer;
+  }
+
+  private persist(input: AskInput, historyScope: string | undefined, answer: string): string {
+    const now = new Date().toISOString();
+    const write = (role: 'user' | 'model', content: string) => historyScope
+      ? this.deps.messages.appendForScope({ guildId: input.guildId, userId: input.userId, role, content, createdAt: now }, historyScope)
+      : this.deps.messages.appendForUser({ guildId: input.guildId, userId: input.userId, role, content, createdAt: now });
+    write('user', input.question);
+    return write('model', answer).sessionId;
   }
 }
