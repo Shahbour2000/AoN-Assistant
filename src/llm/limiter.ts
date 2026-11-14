@@ -9,7 +9,7 @@ export interface ProviderLimits { rpm?: number; tpm?: number; rpd?: number; tpd?
  */
 export class LocalLimiter {
   private readonly events: Array<{ at: number; tokens: number }> = [];
-  constructor(private readonly limits: ProviderLimits, private readonly now: () => number = Date.now, private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), private readonly maxWaitMs = 8_000) {}
+  constructor(private readonly limits: ProviderLimits, private readonly now: () => number = Date.now, private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), private readonly maxWaitMs = 25_000) {}
 
   /** Reserve capacity for one request. Waits briefly when that is enough, otherwise throws a rate_limit error. */
   async acquire(estimatedTokens: number, provider: string): Promise<void> {
@@ -18,9 +18,8 @@ export class LocalLimiter {
       const current = this.now();
       const wait = this.waitTime(current, estimatedTokens);
       if (wait === 0) { this.events.push({ at: current, tokens: estimatedTokens }); return; }
-      if (wait === Infinity || current - started + wait > this.maxWaitMs) {
-        throw new LlmError('rate_limit', `Local ${provider} limit reached`, { provider, retryAfterSeconds: wait === Infinity ? 3600 : Math.ceil(wait / 1000) });
-      }
+      if (wait === Infinity) throw new LlmError('rate_limit', `Local ${provider} limit: one request of about ${estimatedTokens} tokens is larger than the provider's per-minute/per-day token limit (${this.limits.tpm ?? '-'}/${this.limits.tpd ?? '-'}). Use a provider with a larger limit or shorten the prompt.`, { provider, retryAfterSeconds: 60 });
+      if (current - started + wait > this.maxWaitMs) throw new LlmError('rate_limit', `Local ${provider} limit reached`, { provider, retryAfterSeconds: Math.ceil(wait / 1000) });
       await this.sleep(wait);
     }
   }

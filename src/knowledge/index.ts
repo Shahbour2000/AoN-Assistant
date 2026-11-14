@@ -3,7 +3,7 @@ import path from 'node:path';
 import { logger } from '../logging/logger.js';
 import type { Embedder } from '../llm/types.js';
 import { Bm25Index } from './bm25.js';
-import { chunkMarkdown, type ChunkOptions, type KnowledgeChunk } from './chunker.js';
+import { chunkMarkdown, parseFrontMatter, type ChunkOptions, type KnowledgeChunk } from './chunker.js';
 import { tokenize } from './text.js';
 import { dot, normalize, VectorStore } from './vector-store.js';
 
@@ -46,6 +46,32 @@ function isSetupReadme(root: string, file: string): boolean { return path.relati
 
 const RRF_K = 60;
 
+interface GlossaryEntry { triggers: string[][]; expansion: string; }
+
+/**
+ * Glossary files (front matter `type: glossary`) hold tables whose first column is what players say (comma separated)
+ * and whose other columns are the wiki's own terms. They become a synonym map for KEYWORD search: when a query contains
+ * every word of a trigger phrase, the wiki terms are appended to the keyword query. It is data, not code: adding a table row
+ * teaches the bot a new slang word without touching the program.
+ */
+export function parseGlossary(markdown: string): GlossaryEntry[] {
+  const lines = markdown.split(/\r?\n/u);
+  const entries: GlossaryEntry[] = [];
+  lines.forEach((line, index) => {
+    if (!/^\s*\|/u.test(line) || /^\s*\|[\s:|-]+\|?\s*$/u.test(line)) return;
+    if (/^\s*\|[\s:|-]+\|?\s*$/u.test(lines[index + 1] ?? '')) return; // header row
+    const cells = line.split('|').slice(1, -1).map((cell) => cell.trim()).filter((cell, i) => i < 3 || cell);
+    if (cells.length < 2 || !cells[0]) return;
+    const triggers = cells[0].replace(/\([^)]*\)/gu, ' ').split(/[،,;]/u).map((phrase) => tokenize(phrase)).filter((tokens) => tokens.length > 0);
+    const expansion = cells.slice(1).join(' ').replace(/[/()]/gu, ' ').trim();
+    // A row whose slang is already the wiki's own word (same stem) teaches nothing and would only add noise.
+    const expansionWords = new Set(tokenize(expansion));
+    const slang = triggers.filter((tokens) => !tokens.every((token) => expansionWords.has(token)));
+    if (slang.length && expansion) entries.push({ triggers: slang, expansion });
+  });
+  return entries;
+}
+
 export class KnowledgeBase {
   private chunks: KnowledgeChunk[] = [];
   private bm25 = new Bm25Index([]);
@@ -56,6 +82,7 @@ export class KnowledgeBase {
   private reloading: Promise<void> | undefined;
   private readonly queryCache = new Map<string, Float32Array>();
   private embeddingsFailed = false;
+  private glossary: GlossaryEntry[] = [];
 
   constructor(private readonly options: KnowledgeOptions) {
     if (options.embedder) this.store = new VectorStore(options.cacheFile, options.embedder.id);
@@ -77,12 +104,17 @@ export class KnowledgeBase {
     const files = (await markdownFiles(dir)).filter((file) => !isSetupReadme(dir, file));
     const parts: KnowledgeChunk[] = [];
     const signatureParts: string[] = [];
+    const glossary: GlossaryEntry[] = [];
     for (const file of files) {
       const source = path.relative(dir, file).split(path.sep).join('/');
       const info = await stat(file);
       signatureParts.push(`${source}:${info.size}:${info.mtimeMs}`);
-      parts.push(...chunkMarkdown(source, await readFile(file, 'utf8'), this.options.chunk));
+      const text = await readFile(file, 'utf8');
+      const front = parseFrontMatter(text);
+      if (front.meta.type?.toLowerCase() === 'glossary') glossary.push(...parseGlossary(front.body));
+      parts.push(...chunkMarkdown(source, text, this.options.chunk));
     }
+    this.glossary = glossary;
     this.chunks = parts;
     this.signature = signatureParts.join('|');
     this.lastCheck = (this.options.now ?? Date.now)();
@@ -144,7 +176,9 @@ export class KnowledgeBase {
     };
 
     for (const query of cleaned) {
-      const lexical = this.bm25.search(query, 24);
+      // Apply the per-document weight BEFORE the relevance cut-off, otherwise a helper document (glossary) that repeats the query's words
+      // sets the bar so high that the real wiki passages are cut off.
+      const lexical = this.bm25.search(this.expand(query), 24).map((hit) => ({ ...hit, score: hit.score * this.chunks[hit.index]!.weight })).sort((a, b) => b.score - a.score || a.index - b.index);
       const top = lexical[0]?.score ?? 0;
       lexical.filter((hit) => hit.score >= top * 0.3).forEach((hit, rank) => bump(hit.index, rank, 'keyword'));
     }
@@ -184,6 +218,18 @@ export class KnowledgeBase {
     const agreement = selected[0]![1].via.size > 1;
     const confidence: SearchResult['confidence'] = (agreement && coverage >= 0.4) || coverage >= 0.7 ? 'high' : agreement || coverage >= 0.4 ? 'medium' : 'low';
     return { hits, confidence, mode };
+  }
+
+  /** Append the wiki's own terms for any slang phrase found in the query (keyword search only). At most 3 glossary rows, best-matching first. */
+  private expand(query: string): string {
+    if (!this.glossary.length) return query;
+    const words = new Set(tokenize(query));
+    const matched = this.glossary
+      .map((entry) => ({ entry, size: Math.max(0, ...entry.triggers.filter((tokens) => tokens.every((token) => words.has(token))).map((tokens) => tokens.length)) }))
+      .filter((item) => item.size > 0)
+      .sort((a, b) => b.size - a.size)
+      .slice(0, 3);
+    return matched.length ? `${query} ${matched.map((item) => item.entry.expansion).join(' ')}` : query;
   }
 
   private async embedQueries(queries: string[]): Promise<Float32Array[]> {

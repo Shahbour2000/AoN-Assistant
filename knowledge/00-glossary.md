@@ -1,4 +1,5 @@
 ---
+type: glossary
 retrieval_weight: 0.35
 ---
 # قاموس المصطلحات — Glossary (Egyptian Arabic ↔ Wiki Arabic ↔ English)
@@ -21,6 +22,9 @@ retrieval_weight: 0.35
 | شغل، اشتغل، أشتغل | العمل | work |
 | بيع وشراء، تجارة | السوق / التداول | market, trade |
 | ترقية، تطوير الشركة | ترقيات الشركات | company upgrades |
+| اسم الشركة، تغيير الاسم، غير اسم، تسمية الشركة | إعادة التسمية، تغيير الإنتاج وإعادة التسمية والتدمير | rename company |
+| مكان الشركة، موقع الشركة، نقل الشركة، انقل الشركة | المنطقة التي بُنيت فيها، نقل | company location, move company, relocate |
+| امسح الشركة، احذف الشركة، هدم الشركة | تدمير الشركة | delete company, destroy company |
 | عمال، موظفين | العمال | workers |
 | مرتب، أجر، يومية | الأجر | wage, salary |
 

@@ -5,6 +5,7 @@ import type { AonApiClient } from '../aon-api/client.js';
 import { analyzePlayer } from '../aon-api/analysis.js';
 import type { PlayerLinkService } from '../aon-api/linking.js';
 import { LlmError } from '../llm/types.js';
+import { failureMessage } from './failure.js';
 import { logger } from '../logging/logger.js';
 import type { GuildSettingsRepository, LinkedPlayerRepository, TicketRepository } from '../database/repositories.js';
 import { TicketService, TICKET_CLOSE_ID, TICKET_OPEN_ID } from './tickets.js';
@@ -33,11 +34,7 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
       const { failure, retryAfter, httpStatus } = failureInfo(error);
       const original = error instanceof Error ? error : new Error(String(error));
       logger.error('Assistant message failed', { stage: 'discord_ticket_message', failure, guildId: message.guildId, userId: message.author.id, channelId: message.channelId, httpStatus, retryAfterSeconds: retryAfter, error: original.message, stack: original.stack });
-      const failureReply = failure === 'rate_limit' && retryAfter
-        ? `طلبات المساعد كثيرة حاليًا. جرّب تاني بعد ${retryAfter} ثانية.`
-        : failure === 'rate_limit' ? 'طلبات المساعد كثيرة حاليًا. حاول مرة أخرى بعد قليل.'
-        : failure === 'timeout' || failure === 'unavailable' || failure === 'network' ? 'المساعد لا يستطيع الوصول إلى خدمة الإجابة الآن. حاول مرة أخرى بعد قليل.'
-          : 'تعذر إكمال الإجابة الآن. حاول مرة أخرى لاحقًا.';
+      const failureReply = failureMessage(failure, retryAfter);
       try { await message.reply({ content: failureReply, allowedMentions: { repliedUser: false } }); }
       catch (replyError) { const sendFailure = replyError instanceof Error ? replyError : new Error(String(replyError)); logger.error('Unable to send assistant error reply', { stage: 'discord_error_reply', guildId: message.guildId, channelId: message.channelId, error: sendFailure.message, stack: sendFailure.stack }); }
     } finally { clearInterval(typing); }
@@ -184,13 +181,7 @@ async function handleAsk(interaction: ChatInputCommandInteraction, assistant: As
     const { failure, retryAfter, httpStatus } = failureInfo(error);
     const original = error instanceof Error ? error : new Error(String(error));
     logger.error('Slash ask failed', { stage: 'discord_slash_ask', failure, guildId, userId: interaction.user.id, httpStatus, retryAfterSeconds: retryAfter, error: original.message, stack: original.stack });
-    const message = failure === 'rate_limit' && retryAfter
-      ? `طلبات المساعد كثيرة حاليًا. جرّب تاني بعد ${retryAfter} ثانية.`
-      : failure === 'rate_limit'
-      ? 'طلبات المساعد كثيرة حاليًا. حاول مرة أخرى بعد قليل.'
-      : failure === 'timeout' || failure === 'unavailable'
-        ? 'المساعد لا يستطيع الوصول إلى خدمة الإجابة الآن. حاول مرة أخرى بعد قليل.'
-        : 'تعذر إكمال الإجابة الآن. حاول مرة أخرى لاحقًا.';
+    const message = failureMessage(failure, retryAfter);
     await interaction.editReply(message);
   }
 }

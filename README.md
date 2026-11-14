@@ -29,27 +29,30 @@ Discord message
 4. `npm run typecheck`, then `npm run dev` (or `npm run build && npm start`).
 5. In Discord use `/ping`, `/ask`, or talk in the configured assistant channel.
 
-## Choosing a free model provider (researched Nov 2026; limits change — verify in each console)
+## Free providers (verified against official docs on 2026-11-14; see SETUP.md for step-by-step setup)
 
-| Provider (free tier) | Default model | Strengths | Caveats |
+| Provider | Card needed? | What the docs say | Role |
 | --- | --- | --- | --- |
-| **Mistral** (Experiment plan) — recommended primary | `mistral-large-latest` | Strong Arabic and tool calling, generous limits (~tens of requests/min, large token budget) | Free-tier inputs may be used for training: don't send private data |
-| **Gemini** (AI Studio, no billing) — backup + embeddings | `gemini-3.1-flash-lite` / `gemini-embedding-001` | Very capable, good multilingual embeddings | Small daily request cap; data terms differ on free tier; use a key from a non-billing project |
-| **Groq** — backup | `qwen/qwen3.8-27b` (preview) | Very fast | 8K tokens/min free limit starves RAG answers; preview model |
-| **OpenRouter** — emergency only | `openai/gpt-oss-120b:free` | Many models | ~50 requests/day on `:free`; only `:free` ids accepted |
-| Cerebras | — | — | Not free for this use; not wired |
+| **Mistral** (Experiment plan) | No (phone verification) | Free; limits only visible in the console; "API requests … may be used to train Mistral's models" | Main chat model |
+| **Gemini** (AI Studio, no billing) | No | `gemini-3.1-flash-lite` Stable (`gemini-3.5-flash-lite` newer, also Stable); embeddings `gemini-embedding-001`/`gemini-embedding-2` on the OpenAI-compatible endpoint; limits only visible in AI Studio; data used to improve products, human review possible, 18+ only, EEA/UK/CH need paid services | Backup chat + embeddings |
+| **Groq** (Free tier) | No (card only to upgrade) | `qwen/qwen3.8-27b`, `openai/gpt-oss-120b`: 30 req/min, 1K req/day, **8K tokens/min**, 200K tokens/day; no data retention by default, ZDR available | Last-resort backup only |
+| **Cloudflare Workers AI** (Free plan) | No | 10,000 neurons/day free, then calls fail (not billed); `@cf/baai/bge-m3` embeddings; OpenAI-compatible `/ai/v1/embeddings` | Optional hard-stop embeddings |
+| OpenRouter `:free` | Unclear | 20 req/min, **50 req/day** (1,000/day only after buying ≥10 credits) | Emergency only |
+| Cerebras | **Yes** (payment method required) | — | Excluded |
+| GitHub Models | — | **Retired 2026-07-30** | Excluded |
 
-Intelligence was prioritised over raw limits. Change `LLM_PRIMARY` / `LLM_BACKUP` / keys / models in `.env` without touching code.
+**Privacy:** free tiers may use what you send; tell your members. **Cost safety:** the code only talks to the providers above and never switches plans; billing depends on your *account* settings (see SETUP.md section 8).
 
 ## Environment variables
 
-See `.env.example` for the annotated list: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `MISTRAL_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
+See `.env.example` (complete, with placeholders) and `SETUP.md`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `MISTRAL_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
 
 ## Commands
 
 - `npm run dev` / `npm run build` / `npm start` — run, compile, run compiled.
 - `npm run typecheck` — source plus tests and eval.
-- `npm test` — offline test suites (all external services mocked: scripted model, fake HTTP, in-memory DB). **These do not prove live model quality.**
+- `npm test` — offline test suites (including `test/regression.test.ts`, the real Discord conversations that failed) (all external services mocked: scripted model, fake HTTP, in-memory DB). **These do not prove live model quality.**
+- `npm run check:providers` — verifies your keys, that the configured chat/embedding model IDs exist, one tiny chat call, and English↔Arabic embedding similarity. Run this first.
 - `npm run eval [filter]` — **live** evaluation against the real model provider and the real AoN API (`eval/scenarios.ts`: general chat, beginner help, Egyptian Arabic, hallucination traps, API tools, simulated API faults). Consumes free-tier quota; needs keys and internet. Scenarios with a REVIEW note need a human to read the answer.
 
 ## Player accounts and personalized answers

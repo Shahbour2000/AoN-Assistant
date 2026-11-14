@@ -16,7 +16,14 @@ export interface AgentOptions {
   maxTokens?: number;
   toolTimeoutMs?: number;
 }
-export interface AgentInput { system: string; history: ChatMessage[]; userMessage: string; }
+export interface AgentInput {
+  system: string; history: ChatMessage[]; userMessage: string;
+  /**
+   * Local wiki search run BEFORE the first model call (free: no model tokens). When it finds passages they are handed to the model as the
+   * result of its own `search_knowledge` call, which saves a whole model round trip for most game questions. The model may still search again.
+   */
+  prefetchQueries?: string[] | undefined;
+}
 export interface TraceEntry { step: number; tool: string; args: string; status: string; ms: number; }
 export interface AgentOutcome {
   answer: string;
@@ -48,7 +55,20 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
   let step = 0;
   let provider = llm.id;
   let emptyRetries = 0;
+  let maxTokens = options.maxTokens ?? 1400;
   const historyText = input.history.map((message) => message.content ?? '').join('\n');
+
+  if (input.prefetchQueries?.length && byName.has('search_knowledge')) {
+    const args = JSON.stringify({ queries: input.prefetchQueries, limit: 4 });
+    const { result, ms } = await executeTool('search_knowledge', args, byName, toolContext, cache, options.toolTimeoutMs ?? 25_000);
+    if (result.status === 'ok') {
+      const text = serialize(result);
+      messages.push({ role: 'assistant', content: null, toolCalls: [{ id: 'prefetch1', name: 'search_knowledge', arguments: args }] });
+      messages.push({ role: 'tool', toolCallId: 'prefetch1', name: 'search_knowledge', content: text });
+      trace.push({ step: 0, tool: 'search_knowledge', args: `(automatic) ${args.slice(0, 280)}`, status: result.status, ms });
+      evidence.push({ tool: 'search_knowledge', kind: 'knowledge', args, status: result.status, text });
+    }
+  }
 
   for (;;) {
     step++;
@@ -56,7 +76,7 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
     if (lastChance && messages[messages.length - 1]?.role === 'tool') {
       messages.push({ role: 'user', content: '[system note] Tool budget reached. Answer the player now using only what you have gathered. If something is missing, say so plainly.' });
     }
-    const response = await llm.chat({ messages, ...(specs.length ? { tools: specs } : {}), toolChoice: lastChance ? 'none' : 'auto', maxTokens: options.maxTokens ?? 1400, temperature: 0.3 });
+    const response = await llm.chat({ messages, ...(specs.length ? { tools: specs } : {}), toolChoice: lastChance ? 'none' : 'auto', maxTokens, temperature: 0.3 });
     llmCalls++;
     provider = `${response.provider}:${response.model}`;
 
@@ -79,9 +99,15 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
 
     const draft = response.content.trim();
     if (!draft) {
-      // Empty completions happen (reasoning ate the budget, provider hiccup). Retry once with a nudge instead of failing the player.
-      if (emptyRetries++ < 1) { messages.push({ role: 'user', content: '[system note] Your last reply was empty. Reply to the player now.' }); continue; }
-      throw new LlmError('invalid_response', 'The model returned an empty answer twice', { provider: response.provider });
+      // Empty completions happen: reasoning models can spend the whole token budget thinking, and providers sometimes return nothing.
+      // Log why (this is what a developer needs to see), then retry: with a bigger budget if it ran out, otherwise with a nudge.
+      logger.warn('Model returned an empty answer', { provider, finishReason: response.finishReason, completionTokens: response.usage?.completionTokens, maxTokens, step, retry: emptyRetries });
+      if (emptyRetries++ < 2) {
+        if (response.finishReason === 'length') maxTokens = Math.min(maxTokens * 2, 4096);
+        else messages.push({ role: 'user', content: '[system note] Your last reply was empty. Reply to the player now.' });
+        continue;
+      }
+      throw new LlmError('invalid_response', `The model returned an empty answer ${emptyRetries} times (finish reason: ${response.finishReason ?? 'unknown'})`, { provider: response.provider });
     }
 
     const issues = validation === 'off' ? [] : await audit({ question: input.userMessage, history: historyText, answer: draft, evidence }, llm, validation === 'llm');

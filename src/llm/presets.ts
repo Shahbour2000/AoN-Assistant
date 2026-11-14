@@ -7,7 +7,10 @@ import type { Embedder, LlmProvider } from './types.js';
 export type EnvLike = Record<string, string | undefined>;
 
 interface Preset {
+  /** May contain `{VAR}` placeholders that are filled from the environment (Cloudflare needs the account id). */
   baseUrl: string;
+  /** True when the provider is only used for embeddings (no chat/tool-calling verified). */
+  embeddingsOnly?: boolean;
   keyEnv: string;
   defaultModel: string;
   /** Free-tier ceilings published by the provider at the time of writing; override with LLM_LIMITS_<NAME>. */
@@ -43,6 +46,13 @@ export const PROVIDER_PRESETS: Record<string, Preset> = {
     limits: { rpm: 12, rpd: 400 },
     embedding: { model: 'gemini-embedding-001', rpm: 60 },
   },
+  cloudflare: {
+    // Workers AI free plan: 10,000 "neurons" per day at no charge, and when it is used up further calls FAIL instead of being billed
+    // (docs: developers.cloudflare.com/workers-ai/platform/pricing). That hard stop makes it the safest embedding provider. Embeddings only here.
+    baseUrl: 'https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1', keyEnv: 'CLOUDFLARE_API_TOKEN', defaultModel: '', embeddingsOnly: true,
+    limits: {},
+    embedding: { model: '@cf/baai/bge-m3', rpm: 60 },
+  },
   openrouter: {
     baseUrl: 'https://openrouter.ai/api/v1', keyEnv: 'OPENROUTER_API_KEY', defaultModel: 'openai/gpt-oss-120b:free',
     limits: { rpm: 18, rpd: 45 },
@@ -52,6 +62,15 @@ export const PROVIDER_PRESETS: Record<string, Preset> = {
 /** Order used only when LLM_PRIMARY is unset. */
 const AUTO_PRIMARY_ORDER = ['mistral', 'gemini', 'groq'];
 
+/** Replace `{VAR}` placeholders with environment values; fails clearly when one is missing. */
+export function resolveBaseUrl(template: string, env: EnvLike): string {
+  return template.replace(/\{([A-Z0-9_]+)\}/gu, (_match, name: string) => {
+    const value = env[name]?.trim();
+    if (!value) throw new Error(`${name} is required`);
+    return encodeURIComponent(value);
+  });
+}
+
 export interface ProviderSpec { provider: string; model: string; }
 
 /** `mistral:mistral-large-latest` -> { provider: 'mistral', model: 'mistral-large-latest' }; a bare provider name uses its default model. */
@@ -59,6 +78,7 @@ export function parseProviderSpec(spec: string): ProviderSpec {
   const text = spec.trim();
   const index = text.indexOf(':');
   const provider = (index === -1 ? text : text.slice(0, index)).toLowerCase();
+  if (PROVIDER_PRESETS[provider]?.embeddingsOnly) throw new Error(`Provider "${provider}" is only used for embeddings (set EMBEDDING_PROVIDER=${provider}), not as a chat model`);
   if (!PROVIDER_PRESETS[provider]) throw new Error(`Unknown LLM provider "${provider}". Supported: ${Object.keys(PROVIDER_PRESETS).join(', ')}`);
   const model = index === -1 ? PROVIDER_PRESETS[provider]!.defaultModel : text.slice(index + 1).trim();
   if (!model) throw new Error(`Missing model name in "${spec}"`);
@@ -85,7 +105,7 @@ export function buildProvider(spec: ProviderSpec, env: EnvLike, fetcher?: FetchL
   // Hard safety rail: OpenRouter bills any model that is not an explicit ":free" variant.
   if (spec.provider === 'openrouter' && !spec.model.endsWith(':free')) throw new Error('OpenRouter models must end with ":free" so the bot can never incur charges');
   const limits = parseLimits(env[`LLM_LIMITS_${spec.provider.toUpperCase()}`]) ?? preset.limits;
-  return new OpenAiCompatibleProvider({ name: spec.provider, baseUrl: preset.baseUrl, apiKey, model: spec.model, limits, extraBody: preset.extraBody?.(spec.model, env) ?? {}, timeoutMs: Number(env.LLM_TIMEOUT_MS) || 45_000 }, fetcher);
+  return new OpenAiCompatibleProvider({ name: spec.provider, baseUrl: resolveBaseUrl(preset.baseUrl, env), apiKey, model: spec.model, limits, extraBody: preset.extraBody?.(spec.model, env) ?? {}, timeoutMs: Number(env.LLM_TIMEOUT_MS) || 45_000 }, fetcher);
 }
 
 /** Primary first, then backups in the listed order. Missing keys for *backups* are skipped with a warning; a missing primary key is an error. */
@@ -113,13 +133,16 @@ export function buildLlm(env: EnvLike, fetcher?: FetchLike, warn: (message: stri
 export function buildEmbedder(env: EnvLike, fetcher?: FetchLike): Embedder | undefined {
   const choice = (env.EMBEDDING_PROVIDER?.trim().toLowerCase() || 'auto');
   if (choice === 'none' || choice === 'off') return undefined;
-  const candidates = choice === 'auto' ? ['gemini', 'mistral'] : [choice];
+  const candidates = choice === 'auto' ? ['gemini', 'cloudflare', 'mistral'] : [choice];
   for (const name of candidates) {
     const preset = PROVIDER_PRESETS[name];
     if (!preset?.embedding) { if (choice !== 'auto') throw new Error(`Provider "${name}" has no embeddings preset`); continue; }
     const apiKey = env[preset.keyEnv]?.trim();
     if (!apiKey) { if (choice !== 'auto') throw new Error(`${preset.keyEnv} is required for EMBEDDING_PROVIDER=${name}`); continue; }
-    return new OpenAiCompatibleEmbedder({ name, baseUrl: preset.baseUrl, apiKey, model: env.EMBEDDING_MODEL?.trim() || preset.embedding.model, rpm: preset.embedding.rpm }, fetcher);
+    let baseUrl: string;
+    try { baseUrl = resolveBaseUrl(preset.baseUrl, env); }
+    catch (error) { if (choice !== 'auto') throw error; continue; }
+    return new OpenAiCompatibleEmbedder({ name, baseUrl, apiKey, model: env.EMBEDDING_MODEL?.trim() || preset.embedding.model, rpm: preset.embedding.rpm }, fetcher);
   }
   return undefined;
 }

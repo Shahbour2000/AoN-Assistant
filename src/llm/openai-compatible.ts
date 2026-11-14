@@ -41,7 +41,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   }
 
   async chat(request: ChatRequest): Promise<ChatResponse> {
-    const estimated = estimateMessagesTokens(request.messages) + (request.tools ?? []).reduce((sum, tool) => sum + estimateTokens(JSON.stringify(tool)), 0) + (request.maxTokens ?? 1024);
+    const estimated = estimateMessagesTokens(request.messages) + (request.tools ?? []).reduce((sum, tool) => sum + estimateTokens(JSON.stringify(tool)), 0) + Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS);
     await this.limiter?.acquire(estimated, this.config.name);
     const tools = request.tools?.length ? request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) : undefined;
     const body: Record<string, unknown> = {
@@ -81,6 +81,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     }
   }
 }
+
+/** Tokens reserved for the answer when checking local limits (the real usage replaces it afterwards). Reserving the full max_tokens made a single call look 2-3x bigger than it was. */
+const COMPLETION_RESERVE_TOKENS = 600;
 
 export interface EmbeddingConfig { name: string; baseUrl: string; apiKey: string; model: string; timeoutMs?: number; batchSize?: number; /** max requests/minute we allow ourselves */ rpm?: number; }
 

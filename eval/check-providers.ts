@@ -6,15 +6,16 @@
  * It sends only short fixed test strings and never reads the knowledge folder.
  */
 import 'dotenv/config';
-import { PROVIDER_PRESETS, buildEmbedder, buildLlm, parseProviderSpec } from '../src/llm/presets.js';
+import { PROVIDER_PRESETS, buildEmbedder, buildLlm, parseProviderSpec, resolveBaseUrl } from '../src/llm/presets.js';
 
 const env = process.env;
 async function listModels(provider: string): Promise<string[] | string> {
   const preset = PROVIDER_PRESETS[provider]!;
   const key = env[preset.keyEnv]?.trim();
   if (!key) return 'no key set';
+  if (provider === 'cloudflare') return 'model listing not available on this endpoint (the embedding test below checks it directly)';
   try {
-    const response = await fetch(`${preset.baseUrl}/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20_000) });
+    const response = await fetch(`${resolveBaseUrl(preset.baseUrl, env)}/models`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20_000) });
     if (!response.ok) return `HTTP ${response.status} ${(await response.text()).slice(0, 160)}`;
     const body = await response.json() as { data?: Array<{ id?: string }>; models?: Array<{ name?: string }> };
     return (body.data?.map((m) => m.id ?? '') ?? body.models?.map((m) => (m.name ?? '').replace(/^models\//u, '')) ?? []).filter(Boolean);
@@ -34,11 +35,11 @@ async function main() {
   const embedProvider = (env.EMBEDDING_PROVIDER?.trim().toLowerCase() || 'auto');
   const embedder = buildEmbedder(env);
   console.log(`Embeddings: ${embedder ? embedder.id : 'NONE (search will be keyword-only)'}  (EMBEDDING_PROVIDER=${embedProvider})`);
-  for (const name of ['gemini', 'mistral']) if (env[PROVIDER_PRESETS[name]!.keyEnv]?.trim()) wanted.add(name);
+  for (const name of ['gemini', 'cloudflare', 'mistral']) if (env[PROVIDER_PRESETS[name]!.keyEnv]?.trim()) wanted.add(name);
 
   for (const provider of wanted) {
     const models = await listModels(provider);
-    if (typeof models === 'string') { console.log(`✗ ${provider}: could not list models — ${models}`); continue; }
+    if (typeof models === 'string') { console.log(`${provider === 'cloudflare' ? '·' : '✗'} ${provider}: ${models}`); continue; }
     console.log(`✓ ${provider}: ${models.length} models visible`);
     for (const spec of chat.filter((c) => c.provider === provider)) console.log(`  ${models.includes(spec.model) ? '✓' : '✗ NOT LISTED'} chat model ${spec.model}`);
     const embeddingModel = env.EMBEDDING_MODEL?.trim() || PROVIDER_PRESETS[provider]!.embedding?.model;

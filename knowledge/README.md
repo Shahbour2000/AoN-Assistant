@@ -7,4 +7,5 @@ Tips for good retrieval:
 - Keep tables intact; long tables are split by rows with the header repeated.
 - Arabic and English are both fine; mixed documents work.
 - Optional front matter lowers or raises a file's ranking: `---` / `retrieval_weight: 0.35` / `---` (0–2, default 1). `00-glossary.md` uses it so slang↔wiki-term mappings help search without outranking real content. Add new slang there.
+- Slang/synonym tables: a file with front matter `type: glossary` is used as a synonym map for keyword search. In its tables, column 1 = what players say (comma-separated), other columns = the wiki's own terms; add a row to teach the bot a new slang word. Glossary files contain words only — no game rules or numbers.
 - Never put guesses in these files: everything here is treated as the official source for game mechanics.

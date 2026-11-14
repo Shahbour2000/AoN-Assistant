@@ -37,6 +37,13 @@ export interface AssistantDeps {
 const ACTIVE_PLAYER_TTL_MS = 2 * 3_600_000;
 const UNVERIFIED_NOTE = (arabic: boolean) => arabic ? '\n\n_ملاحظة: مقدرتش أتأكد من بعض الأرقام دي من مصادري، فاعتبرها تقريبية._' : '\n\n_Note: I could not verify some of the figures above against my sources, so treat them as approximate._';
 
+/** Queries for the automatic wiki search. A short follow-up ("والتالتة؟") is searched together with the previous question so it keeps its topic. */
+export function prefetchQueries(question: string, previousQuestion?: string): string[] {
+  const queries = [question.trim()];
+  if (previousQuestion && question.trim().length < 40) queries.push(`${previousQuestion.trim().slice(0, 200)} ${question.trim()}`);
+  return queries.filter(Boolean);
+}
+
 export class AssistantService {
   private readonly memory: ConversationMemory;
   private readonly gate: AssistantRequestGate;
@@ -69,7 +76,8 @@ export class AssistantService {
 
     let outcome: AgentOutcome;
     try {
-      outcome = await runAgent({ llm, tools, toolContext, validation: this.deps.validation ?? 'basic' }, { system, history: memory.messages, userMessage: input.question });
+      const previousQuestion = [...memory.messages].reverse().find((message) => message.role === 'user')?.content ?? undefined;
+      outcome = await runAgent({ llm, tools, toolContext, validation: this.deps.validation ?? 'basic' }, { system, history: memory.messages, userMessage: input.question, prefetchQueries: prefetchQueries(input.question, previousQuestion) });
     } catch (error) {
       logger.error('Assistant pipeline failed', { guildId: input.guildId, userId: input.userId, conversationId: input.conversationId, error: error instanceof Error ? error.message : String(error) });
       throw error;
