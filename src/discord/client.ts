@@ -151,7 +151,16 @@ async function handlePlayerCommand(interaction: ChatInputCommandInteraction, too
 function display(value: unknown): string { return value === undefined || value === null || value === '' ? 'unavailable' : String(value).slice(0, 100); }
 function safeDiscordText(value: unknown): string { return String(value).replace(/([\\`*_{}\[\]()<>#+\-.!|~])/gu, '\\$1').replace(/@/gu, '@\u200b').slice(0, 100); }
 
-export async function shouldHandleMessage(message: Pick<Message, 'guildId' | 'channelId' | 'mentions' | 'reference' | 'fetchReference'>, botId: string, ticketChannelId?: string): Promise<boolean> {
+/** The only parts of a Discord message the routing decision needs. `Message` satisfies this structurally; tests can pass plain objects. */
+export interface RoutableMessage {
+  guildId: string | null;
+  channelId: string;
+  mentions: { has(userId: string): boolean };
+  reference: { messageId?: string | undefined } | null;
+  fetchReference(): Promise<{ author: { id: string } }>;
+}
+
+export async function shouldHandleMessage(message: RoutableMessage, botId: string, ticketChannelId?: string): Promise<boolean> {
   if (!message.guildId) return false;
   if (ticketChannelId && message.channelId === ticketChannelId) return false;
   if (message.mentions.has(botId)) return true;

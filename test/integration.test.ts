@@ -9,7 +9,7 @@ import { MessageRepository, TicketRepository } from '../src/database/repositorie
 import { shouldHandleMessage, splitDiscordMessage } from '../src/discord/client.js';
 import { canCloseTicket, createTicketPermissionOverwrites } from '../src/discord/tickets.js';
 import { OverwriteType, PermissionFlagsBits, PermissionOverwrites } from 'discord.js';
-import { AonApiClient, AonApiError } from '../src/aon-api/client.js';
+import { AonApiClient, AonApiError, type PlayerSnapshot } from '../src/aon-api/client.js';
 import { analyzePlayer, buildPlayerContext } from '../src/aon-api/analysis.js';
 import { PlayerLinkService } from '../src/aon-api/linking.js';
 import { LinkedPlayerRepository } from '../src/database/repositories.js';
@@ -126,7 +126,7 @@ test('link confirmation is explicitly unverified, conflict-safe, and unlink supp
 });
 
 test('player analysis compares normalized recent momentum and does not invent historical specialization', () => {
-  const base = { fetchedAt: '2026-11-06T00:00:00.000Z', profile: { id: 'usr_123', username: 'Player' }, stats: { id: 'usr_123', username: 'Player', damage: { all: '9000000', week: '30', month: '100' }, work: { all: '500000', week: '5', month: '100' }, trade: { all: '800000', week: '5', month: '100' } }, companies: { total: 0, companies: [] } } as const;
+  const base: PlayerSnapshot = { fetchedAt: '2026-11-06T00:00:00.000Z', profile: { id: 'usr_123', username: 'Player' }, stats: { id: 'usr_123', username: 'Player', damage: { all: '9000000', week: '30', month: '100' }, work: { all: '500000', week: '5', month: '100' }, trade: { all: '800000', week: '5', month: '100' } }, companies: { total: 0, companies: [] } };
   const warMomentum = analyzePlayer(base);
   assert.equal(warMomentum.currentFocus, 'war-focused');
   assert.equal(warMomentum.historicalSpecialization, 'insufficient-data');

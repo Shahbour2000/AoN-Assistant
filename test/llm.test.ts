@@ -106,3 +106,33 @@ test('embedder returns vectors in index order and rejects malformed responses', 
   const bad = new OpenAiCompatibleEmbedder({ name: 'm', baseUrl: 'https://e.test/v1', apiKey: 'k', model: 'e' }, (async () => json({ data: [] })) as never);
   await assert.rejects(() => bad.embed(['a'], 'query'), (e: unknown) => e instanceof LlmError && e.kind === 'invalid_response');
 });
+
+test('provider selection: explicit primary wins; unset primary auto-picks by key in quality order and warns; openrouter is never auto-selected; no key means a clear error', () => {
+  const warnings: string[] = [];
+  const warn = (message: string) => { warnings.push(message); };
+  assert.deepEqual(buildLlm({ LLM_PRIMARY: 'mistral:mistral-large-latest', MISTRAL_API_KEY: 'k', GROQ_API_KEY: 'g' }, undefined, warn).specs, [{ provider: 'mistral', model: 'mistral-large-latest' }]);
+  assert.equal(warnings.length, 0);
+  assert.equal(buildLlm({ MISTRAL_API_KEY: 'k', GROQ_API_KEY: 'g' }, undefined, warn).specs[0]?.provider, 'mistral');
+  assert.match(warnings[0] ?? '', /LLM_PRIMARY is not set/u);
+  assert.equal(buildLlm({ GROQ_API_KEY: 'g', GROQ_MODEL: 'llama-3.3-70b-versatile' }, undefined, warn).specs[0]?.model, 'llama-3.3-70b-versatile');
+  assert.throws(() => buildLlm({ OPENROUTER_API_KEY: 'o' }), /No language model is configured/u);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'openrouter:openai/gpt-4o', OPENROUTER_API_KEY: 'o' }), /:free/u);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'mistral' }), /MISTRAL_API_KEY is required/u);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'openai:gpt-4o', MISTRAL_API_KEY: 'k' }), /Unknown LLM provider/u);
+  const withBackups = buildLlm({ LLM_PRIMARY: 'mistral', LLM_BACKUP: 'gemini, groq', MISTRAL_API_KEY: 'k', GROQ_API_KEY: 'g' }, undefined, warn);
+  assert.deepEqual(withBackups.specs.map((spec) => spec.provider), ['mistral', 'groq']);
+  assert.ok(warnings.some((message) => /gemini.*skipped/u.test(message)), 'a backup without a key is skipped with a warning');
+});
+
+test('limit overrides accept both "rpm:30" and "rpm=30" and reject unknown keys', () => {
+  assert.deepEqual(parseLimits('rpm:30,tpm=8000'), { rpm: 30, tpm: 8000 });
+  assert.throws(() => parseLimits('rps:3'), /Unknown limit key/u);
+});
+
+test('embedder selection: auto prefers Gemini, falls back to Mistral, none disables, explicit missing key is an error', () => {
+  assert.match(buildEmbedder({ GEMINI_API_KEY: 'g', MISTRAL_API_KEY: 'm' })!.id, /gemini/u);
+  assert.match(buildEmbedder({ MISTRAL_API_KEY: 'm' })!.id, /mistral/u);
+  assert.equal(buildEmbedder({ GEMINI_API_KEY: 'g', EMBEDDING_PROVIDER: 'none' }), undefined);
+  assert.equal(buildEmbedder({}), undefined);
+  assert.throws(() => buildEmbedder({ EMBEDDING_PROVIDER: 'gemini' }), /GEMINI_API_KEY is required/u);
+});

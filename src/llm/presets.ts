@@ -49,6 +49,9 @@ export const PROVIDER_PRESETS: Record<string, Preset> = {
   },
 };
 
+/** Order used only when LLM_PRIMARY is unset. */
+const AUTO_PRIMARY_ORDER = ['mistral', 'gemini', 'groq'];
+
 export interface ProviderSpec { provider: string; model: string; }
 
 /** `mistral:mistral-large-latest` -> { provider: 'mistral', model: 'mistral-large-latest' }; a bare provider name uses its default model. */
@@ -66,7 +69,7 @@ export function parseLimits(text: string | undefined): ProviderLimits | undefine
   if (!text?.trim()) return undefined;
   const limits: ProviderLimits = {};
   for (const part of text.split(',')) {
-    const [key, value] = part.split(':').map((item) => item.trim());
+    const [key, value] = part.split(/[:=]/u).map((item) => item.trim());
     const number = Number(value);
     if (!key || !Number.isFinite(number) || number <= 0) throw new Error(`Invalid limit "${part}"`);
     if (key === 'rpm' || key === 'tpm' || key === 'rpd' || key === 'tpd') limits[key] = number;
@@ -87,8 +90,14 @@ export function buildProvider(spec: ProviderSpec, env: EnvLike, fetcher?: FetchL
 
 /** Primary first, then backups in the listed order. Missing keys for *backups* are skipped with a warning; a missing primary key is an error. */
 export function buildLlm(env: EnvLike, fetcher?: FetchLike, warn: (message: string) => void = () => undefined): { llm: LlmProvider; specs: ProviderSpec[] } {
-  const rawPrimary = env.LLM_PRIMARY?.trim() || (env.GROQ_API_KEY?.trim() ? `groq:${env.GROQ_MODEL?.trim() || PROVIDER_PRESETS.groq!.defaultModel}` : '');
-  if (!rawPrimary) throw new Error('Set LLM_PRIMARY (for example "mistral:mistral-large-latest") and the matching API key.');
+  let rawPrimary = env.LLM_PRIMARY?.trim() ?? '';
+  if (!rawPrimary) {
+    // No explicit choice: pick the first provider that has a key, in order of answer quality. OpenRouter is never auto-selected.
+    const auto = AUTO_PRIMARY_ORDER.find((name) => env[PROVIDER_PRESETS[name]!.keyEnv]?.trim());
+    if (!auto) throw new Error('No language model is configured. Set LLM_PRIMARY (for example "mistral:mistral-large-latest") and the matching API key (MISTRAL_API_KEY).');
+    rawPrimary = auto === 'groq' && env.GROQ_MODEL?.trim() ? `groq:${env.GROQ_MODEL.trim()}` : auto;
+    warn(`LLM_PRIMARY is not set; using "${rawPrimary}" because its API key is present. Set LLM_PRIMARY explicitly to choose the model.`);
+  }
   const primary = parseProviderSpec(rawPrimary);
   const backups = (env.LLM_BACKUP ?? '').split(',').map((item) => item.trim()).filter(Boolean).map(parseProviderSpec);
   const providers: LlmProvider[] = [buildProvider(primary, env, fetcher)];
