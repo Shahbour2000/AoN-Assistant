@@ -107,16 +107,24 @@ test('embedder returns vectors in index order and rejects malformed responses', 
   await assert.rejects(() => bad.embed(['a'], 'query'), (e: unknown) => e instanceof LlmError && e.kind === 'invalid_response');
 });
 
-test('provider selection: explicit primary wins; unset primary auto-picks Groq, then Cloudflare, then OpenRouter, and warns; no key means a clear error', () => {
+test('provider selection: explicit primary wins; blank LLM_PRIMARY + LLM_BACKUP builds the full automatic chain from the available keys', () => {
   const warnings: string[] = [];
   const warn = (message: string) => { warnings.push(message); };
   const cf = { CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_ACCOUNT_ID: 'a' };
   assert.deepEqual(buildLlm({ LLM_PRIMARY: 'cloudflare:@cf/openai/gpt-oss-120b', ...cf, GROQ_API_KEY: 'g' }, undefined, warn).specs, [{ provider: 'cloudflare', model: '@cf/openai/gpt-oss-120b' }]);
   assert.equal(warnings.length, 0);
-  assert.equal(buildLlm({ ...cf, GROQ_API_KEY: 'g' }, undefined, warn).specs[0]?.provider, 'groq');
-  assert.match(warnings[0] ?? '', /LLM_PRIMARY is not set/u);
-  assert.equal(buildLlm({ GROQ_API_KEY: 'g', GROQ_MODEL: 'llama-3.3-70b-versatile' }, undefined, warn).specs[0]?.model, 'llama-3.3-70b-versatile');
-  assert.equal(buildLlm({ OPENROUTER_API_KEY: 'o' }, undefined, warn).specs[0]?.provider, 'openrouter');
+  // Full chain: Groq main -> Cloudflare chat -> Groq secondary -> OpenRouter free (the user's real .env shape: LLM_PRIMARY= and LLM_BACKUP= blank).
+  const all = buildLlm({ LLM_PRIMARY: '', LLM_BACKUP: '', GROQ_API_KEY: 'g', GROQ_MODEL: 'qwen/qwen3.8-27b', OPENROUTER_API_KEY: 'o', ...cf }, undefined, warn);
+  assert.deepEqual(all.specs.map((spec) => `${spec.provider}:${spec.model}`), ['groq:qwen/qwen3.8-27b', 'cloudflare:@cf/openai/gpt-oss-120b', 'groq:openai/gpt-oss-120b', 'openrouter:google/gemma-4-26b-a4b-it:free']);
+  assert.match(warnings.at(-1) ?? '', /building the chain automatically/u);
+  // The secondary Groq model is never the same as the main one.
+  assert.equal(buildLlm({ GROQ_API_KEY: 'g', GROQ_MODEL: 'openai/gpt-oss-120b' }, undefined, warn).specs[1]?.model, 'qwen/qwen3.8-27b');
+  // Providers without credentials are left out: Cloudflare needs token AND account id; OpenRouter needs its key.
+  assert.deepEqual(buildLlm({ GROQ_API_KEY: 'g', CLOUDFLARE_API_TOKEN: 't' }, undefined, warn).specs.map((spec) => spec.provider), ['groq', 'groq']);
+  assert.deepEqual(buildLlm({ CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_ACCOUNT_ID: 'a' }, undefined, warn).specs.map((spec) => spec.provider), ['cloudflare']);
+  assert.deepEqual(buildLlm({ OPENROUTER_API_KEY: 'o' }, undefined, warn).specs.map((spec) => spec.provider), ['openrouter']);
+  // An unapproved GROQ_MODEL is a startup error, never silently replaced.
+  assert.throws(() => buildLlm({ GROQ_API_KEY: 'g', GROQ_MODEL: 'some/paid-model' }), /not on the approved free-model list/u);
   assert.throws(() => buildLlm({}), /No language model is configured/u);
   assert.throws(() => buildLlm({ LLM_PRIMARY: 'cloudflare' }), /CLOUDFLARE_API_TOKEN is required/u);
   assert.throws(() => buildLlm({ LLM_PRIMARY: 'cloudflare', CLOUDFLARE_API_TOKEN: 't' }), /CLOUDFLARE_ACCOUNT_ID is required/u);
@@ -124,6 +132,33 @@ test('provider selection: explicit primary wins; unset primary auto-picks Groq, 
   const withBackups = buildLlm({ LLM_PRIMARY: 'groq', LLM_BACKUP: 'openrouter, cloudflare', GROQ_API_KEY: 'g', ...cf }, undefined, warn);
   assert.deepEqual(withBackups.specs.map((spec) => spec.provider), ['groq', 'cloudflare']);
   assert.ok(warnings.some((message) => /openrouter.*skipped/u.test(message)), 'a backup without a key is skipped with a warning');
+});
+
+test('failover scenario: Groq answers, then its local token limit is hit, the next question is served by Cloudflare with no waiting, later questions skip Groq', async () => {
+  const calls = { groq: 0, cloudflare: 0 };
+  const ok = (text: string, prompt: number) => json({ choices: [{ message: { content: text } }], usage: { prompt_tokens: prompt, completion_tokens: 50 } });
+  const fetcher = (async (url: any) => {
+    const target = String(url);
+    if (target.includes('api.groq.com')) { calls.groq++; return ok('جواب من Groq', 5000); }
+    if (target.includes('api.cloudflare.com')) { calls.cloudflare++; return ok('جواب من Cloudflare', 5000); }
+    throw new Error(`unexpected URL ${target}`);
+  }) as never;
+  const { llm } = buildLlm({ GROQ_API_KEY: 'g', GROQ_MODEL: 'qwen/qwen3.8-27b', CLOUDFLARE_API_TOKEN: 't', CLOUDFLARE_ACCOUNT_ID: 'a' }, fetcher);
+  const bigQuestion = { messages: [{ role: 'user' as const, content: 'x'.repeat(16_000) }], maxTokens: 400 }; // ~5,000 estimated prompt tokens, like a wiki question
+  const started = Date.now();
+  assert.equal((await llm.chat(bigQuestion)).content, 'جواب من Groq');
+  const second = await llm.chat(bigQuestion);     // Groq's 8,000 tokens/minute is exhausted locally -> must fail over immediately
+  assert.equal(second.provider, 'cloudflare');
+  assert.equal(second.content, 'جواب من Cloudflare');
+  assert.ok(Date.now() - started < 5_000, 'failover must not make the player wait for the Groq limiter');
+  assert.deepEqual(calls, { groq: 1, cloudflare: 1 }, 'the locally rejected request never reached Groq');
+  await llm.chat(bigQuestion);                    // Groq is cooling down: goes straight to Cloudflare
+  assert.deepEqual(calls, { groq: 1, cloudflare: 2 });
+});
+
+test('with a single provider the local limiter may still wait (nothing to fail over to)', async () => {
+  const { llm } = buildLlm({ GROQ_API_KEY: 'g', LLM_PRIMARY: 'groq:qwen/qwen3.8-27b' }, (async () => json({ choices: [{ message: { content: 'ok' } }] })) as never);
+  assert.equal((await llm.chat({ messages: [{ role: 'user', content: 'hi' }] })).content, 'ok');
 });
 
 test('limit overrides accept both "rpm:30" and "rpm=30" and reject unknown keys', () => {

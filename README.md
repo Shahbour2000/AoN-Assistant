@@ -19,8 +19,7 @@ Discord message
 - **Knowledge:** drop `.md` files anywhere under `knowledge/` (see `knowledge/README.md`); they are indexed automatically. Embeddings are cached in `data/embeddings.json` by content hash, so only new/changed passages are embedded. If embeddings are unavailable the search degrades to keyword-only and says so in the logs.
 - **Game API:** `https://app.ageofnations.world/api/v1`, read-only, no key. Cached 30 s, deduplicated, paced below 60 requests/min. Statuses: `not_found` only for a real 404; timeouts/429/malformed → "temporarily unavailable", never "doesn't exist".
 - **Memory:** recent whole messages within a token budget plus a rolling summary of older turns, isolated per guild+user+channel. No cross-user leakage.
-- **Cost safety:** only free-tier providers are used; the local limiter mirrors each free-tier limit; with `LLM_PRIMARY` blank the chain is every free provider that has a key (Groq → Cloudflare → Groq second model → OpenRouter); a limited provider is skipped until its cool-down ends and the next one answers at once; there is no automatic switch to a paid plan or model.
-- **Token economy:** greetings skip the wiki and tools (~0.3K tokens); wiki questions get the best passages prefetched locally and a small tool set (~2K tokens, one model call); the wiki outline is added only when the search was weak; identical questions in the same context are served from a safe cache (keyed on everything the model sees, so other users/histories never match); if the optional revision call fails, the first draft is returned with its caveat instead of an error.
+- **Cost safety:** only free-tier providers are configured; the local limiter mirrors each free-tier limit; failover goes only to approved free providers: the ones you list in `LLM_BACKUP`, or, when `LLM_PRIMARY` and `LLM_BACKUP` are both blank, every provider whose key is present (Groq main -> Cloudflare -> Groq secondary -> OpenRouter free); there is no automatic switch to a paid plan or model.
 
 ## Setup
 
@@ -28,7 +27,7 @@ Discord message
 2. `cp .env.example .env`, fill in Discord values and at least one LLM key (Groq already works; see SETUP.md).
 3. Put game Markdown in `knowledge/` (the five bundled wiki files plus `00-glossary.md` are included).
 4. `npm run typecheck`, then `npm run dev` (or `npm run build && npm start`).
-5. In Discord use `/ping`, `/ask`, or talk in a ticket channel the bot can see.
+5. In Discord use `/ping`, `/ask`, or talk in the configured assistant channel.
 
 ## Free providers (checked against official docs on 2026-11-20; see SETUP.md)
 
@@ -45,15 +44,14 @@ Free-only by design: `src/llm/free-models.ts` is an allowlist; any model not on 
 
 ## Environment variables
 
-See `.env.example` (complete, with placeholders) and `SETUP.md`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `LLM_PRIMARY` and `LLM_BACKUP` (both normally blank: the free chain is built from the keys present), `LLM_MAX_WAIT_SECONDS`, `GROQ_REASONING_EFFORT`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_DAILY_NEURON_BUDGET`, `CLOUDFLARE_REASONING_EFFORT`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
+See `.env.example` (complete, with placeholders) and `SETUP.md`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_DAILY_NEURON_BUDGET`, `CLOUDFLARE_REASONING_EFFORT`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
 
 ## Commands
 
 - `npm run dev` / `npm run build` / `npm start` — run, compile, run compiled.
 - `npm run typecheck` — source plus tests and eval.
 - `npm test` — offline test suites (including `test/regression.test.ts`, the real Discord conversations that failed) (all external services mocked: scripted model, fake HTTP, in-memory DB). **These do not prove live model quality.**
-- `npm run check:providers` — tests every provider in your chain separately (chat, tool calling, Arabic; `not tested` when it could not run), lists unconfigured providers, tests embeddings, prints a summary table. Needs keys and internet.
-- `npm run eval:retrieval` — real wiki retrieval cases in keyword mode and with the Cloudflare embedder (needs Cloudflare keys for the hybrid half).
+- `npm run check:providers` — verifies your keys, that the configured chat/embedding model IDs exist, one tiny chat call, and English↔Arabic embedding similarity. Run this first.
 - `npm run eval [filter]` — **live** evaluation against the real model provider and the real AoN API (`eval/scenarios.ts`: general chat, beginner help, Egyptian Arabic, hallucination traps, API tools, simulated API faults). Consumes free-tier quota; needs keys and internet. Scenarios with a REVIEW note need a human to read the answer.
 
 ## Player accounts and personalized answers

@@ -41,7 +41,7 @@ export function stemEnglish(token: string): string {
 }
 
 /** Very small stop list: only words that carry no retrieval signal in either language. Content words are never removed. */
-const STOP = new Set(['the', 'and', 'for', 'are', 'was', 'with', 'that', 'this', 'what', 'how', 'can', 'you', 'your', 'many', 'much', 'does', 'did', 'get', 'per', 'each', 'its', 'any', 'have', 'has', 'will', 'would', 'should', 'there', 'they', 'their', 'when', 'which', 'who', 'why', 'not', 'but', 'from', 'into', 'about', 'than', 'then', 'also', 'one', 'من', 'في', 'علي', 'الي', 'عن', 'هو', 'هي', 'ما', 'ماذا', 'كيف', 'هل', 'ان', 'او', 'ايه', 'ازاي', 'يعني', 'طب', 'طيب', 'لو', 'انا', 'انت', 'هوا', 'دي', 'ده', 'دا', 'بتاع', 'بتاعه', 'عايز', 'عاوز', 'محتاج', 'كام', 'فين']);
+const STOP = new Set(['the', 'and', 'for', 'are', 'was', 'with', 'that', 'this', 'what', 'how', 'can', 'you', 'your', 'من', 'في', 'علي', 'الي', 'عن', 'هو', 'هي', 'ما', 'ماذا', 'كيف', 'هل', 'ان', 'او', 'ايه', 'ازاي', 'يعني', 'طب', 'طيب', 'لو', 'انا', 'انت', 'هوا', 'دي', 'ده', 'دا', 'بتاع', 'بتاعه', 'عايز', 'عاوز', 'محتاج', 'كام', 'فين']);
 
 export function tokenize(text: string): string[] {
   const normalized = normalizeArabic(text);

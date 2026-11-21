@@ -11,21 +11,16 @@ export class LocalLimiter {
   private readonly events: Array<{ at: number; tokens: number }> = [];
   constructor(private readonly limits: ProviderLimits, private readonly now: () => number = Date.now, private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), private readonly maxWaitMs = 25_000) {}
 
-  /** Reserve capacity for one request. Waits briefly when that is enough, otherwise throws a rate_limit error that says exactly which limit blocked it. */
-  async acquire(estimatedTokens: number, provider: string, model = ''): Promise<void> {
+  /** Reserve capacity for one request. Waits briefly when that is enough, otherwise throws a rate_limit error. */
+  async acquire(estimatedTokens: number, provider: string): Promise<void> {
     const started = this.now();
     for (;;) {
       const current = this.now();
-      const block = this.blocker(current, estimatedTokens);
-      if (!block) { this.events.push({ at: current, tokens: estimatedTokens }); return; }
-      const label = model ? `${provider}:${model}` : provider;
-      const base = { provider, ...(model ? { model } : {}), source: 'local_limiter' as const, reachedProvider: false, limit: block.limit, requestedTokens: estimatedTokens, usedTokens: block.used, maxTokens: block.max };
-      if (block.wait === Infinity) throw new LlmError('rate_limit', `Local limiter (${label}): one request of about ${estimatedTokens} tokens is larger than the ${block.limit.toUpperCase()} limit (${block.max}). Use a provider with a larger limit or shorten the prompt.`, { ...base, retryAfterSeconds: 60 });
-      if (current - started + block.wait > this.maxWaitMs) {
-        const retryAfterSeconds = Math.ceil(block.wait / 1000);
-        throw new LlmError('rate_limit', `Local limiter (${label}): ${block.limit.toUpperCase()} limit - this request needs about ${estimatedTokens}, ${block.used} of ${block.max} already used in the window; free again in ${retryAfterSeconds}s. Nothing was sent to the provider.`, { ...base, retryAfterSeconds });
-      }
-      await this.sleep(block.wait);
+      const wait = this.waitTime(current, estimatedTokens);
+      if (wait === 0) { this.events.push({ at: current, tokens: estimatedTokens }); return; }
+      if (wait === Infinity) throw new LlmError('rate_limit', `Local ${provider} limit: one request of about ${estimatedTokens} tokens is larger than the provider's per-minute/per-day token limit (${this.limits.tpm ?? '-'}/${this.limits.tpd ?? '-'}). Use a provider with a larger limit or shorten the prompt.`, { provider, retryAfterSeconds: 60 });
+      if (current - started + wait > this.maxWaitMs) throw new LlmError('rate_limit', `Local ${provider} limit reached`, { provider, retryAfterSeconds: Math.ceil(wait / 1000) });
+      await this.sleep(wait);
     }
   }
 
@@ -35,34 +30,29 @@ export class LocalLimiter {
     if (last && last.tokens === estimatedTokens) last.tokens = actualTokens;
   }
 
-  private blocker(now: number, tokens: number): { wait: number; limit: string; used: number; max: number } | undefined {
+  private waitTime(now: number, tokens: number): number {
     const day = 24 * 3_600_000;
     while (this.events.length && this.events[0]!.at <= now - day) this.events.shift();
     const { rpm, tpm, rpd, tpd } = this.limits;
-    let worst: { wait: number; limit: string; used: number; max: number } | undefined;
-    const consider = (wait: number, limit: string, used: number, max: number) => { if (wait > 0 && (!worst || wait > worst.wait)) worst = { wait: wait === Infinity ? Infinity : Math.ceil(wait), limit, used, max }; };
+    let wait = 0;
     const inWindow = (ms: number) => this.events.filter((event) => event.at > now - ms);
     if (rpm !== undefined) {
       const recent = inWindow(60_000);
-      if (recent.length >= rpm) consider(recent[recent.length - rpm]!.at + 60_000 - now, 'rpm', recent.length, rpm);
+      if (recent.length >= rpm) wait = Math.max(wait, recent[recent.length - rpm]!.at + 60_000 - now);
     }
     if (tpm !== undefined) {
-      if (tokens > tpm) return { wait: Infinity, limit: 'tpm', used: 0, max: tpm };
+      if (tokens > tpm) return Infinity;
       const recent = inWindow(60_000);
-      const total = recent.reduce((sum, event) => sum + event.tokens, 0);
-      let used = total, wait = 0;
+      let used = recent.reduce((sum, event) => sum + event.tokens, 0);
       for (const event of recent) { if (used + tokens <= tpm) break; used -= event.tokens; wait = Math.max(wait, event.at + 60_000 - now); }
-      consider(wait, 'tpm', total, tpm);
     }
-    if (rpd !== undefined && this.events.length >= rpd) consider(this.events[this.events.length - rpd]!.at + day - now, 'rpd', this.events.length, rpd);
+    if (rpd !== undefined && this.events.length >= rpd) wait = Math.max(wait, this.events[this.events.length - rpd]!.at + day - now);
     if (tpd !== undefined) {
-      if (tokens > tpd) return { wait: Infinity, limit: 'tpd', used: 0, max: tpd };
-      const total = this.events.reduce((sum, event) => sum + event.tokens, 0);
-      let used = total, wait = 0;
+      if (tokens > tpd) return Infinity;
+      let used = this.events.reduce((sum, event) => sum + event.tokens, 0);
       for (const event of this.events) { if (used + tokens <= tpd) break; used -= event.tokens; wait = Math.max(wait, event.at + day - now); }
-      consider(wait, 'tpd', total, tpd);
     }
-    return worst;
+    return Math.max(0, Math.ceil(wait));
   }
 }
 
@@ -91,7 +81,7 @@ export class NeuronBudget {
   reserve(neurons: number, provider: string): void {
     this.roll();
     if (this.used + neurons > this.dailyLimit) {
-      throw new LlmError('rate_limit', `Local ${provider} free-neuron budget used up for today (${Math.round(this.used)}/${this.dailyLimit}); it resets at 00:00 UTC`, { provider, source: 'local_budget', reachedProvider: false, limit: 'neurons', usedTokens: Math.round(this.used), maxTokens: this.dailyLimit, retryAfterSeconds: secondsUntilUtcMidnight(this.now()) });
+      throw new LlmError('rate_limit', `Local ${provider} free-neuron budget used up for today (${Math.round(this.used)}/${this.dailyLimit}); it resets at 00:00 UTC`, { provider, retryAfterSeconds: secondsUntilUtcMidnight(this.now()) });
     }
     this.used += neurons;
   }

@@ -1,6 +1,5 @@
 import { logger } from '../logging/logger.js';
 import { LlmError, type ChatMessage, type LlmProvider } from '../llm/types.js';
-import { AnswerCache } from './cache.js';
 import type { AgentTool, ToolContext, ToolResult } from './tools/index.js';
 import { InvalidInput } from './tools/types.js';
 import { validateDeterministic, verifyWithLlm, type EvidenceEntry, type Issue } from './validator.js';
@@ -16,11 +15,7 @@ export interface AgentOptions {
   maxRevisions?: number;
   maxTokens?: number;
   toolTimeoutMs?: number;
-  /** Smaller tool set (wiki search + calculator) used when the automatic wiki search found passages and the question shows no sign of needing live data. Saves ~1,000 tokens per call. */
-  leanTools?: AgentTool[];
-  answerCache?: AnswerCache<CachedAnswer>;
 }
-export interface CachedAnswer { answer: string; provider: string; }
 export interface AgentInput {
   system: string; history: ChatMessage[]; userMessage: string;
   /**
@@ -28,12 +23,6 @@ export interface AgentInput {
    * result of its own `search_knowledge` call, which saves a whole model round trip for most game questions. The model may still search again.
    */
   prefetchQueries?: string[] | undefined;
-  /** Greetings, thanks and chit-chat: no wiki search, no tools, a minimal prompt. */
-  smallTalk?: boolean | undefined;
-  /** The question looks like a wiki/mechanics question (no live-data intent), so the lean tool set may be used when the wiki search found passages. */
-  preferLean?: boolean | undefined;
-  /** Text appended to the system prompt only when the automatic wiki search was NOT convincing (the wiki outline helps the model write better searches). */
-  weakEvidenceAddendum?: string | undefined;
 }
 export interface TraceEntry { step: number; tool: string; args: string; status: string; ms: number; }
 export interface AgentOutcome {
@@ -44,10 +33,6 @@ export interface AgentOutcome {
   revisions: number;
   unresolvedIssues: Issue[];
   provider: string;
-  /** True when the answer was served from the answer cache (no model call). */
-  cached?: boolean;
-  /** Which tool set was offered: `none` (small talk), `lean` or `full`. */
-  toolSet?: 'none' | 'lean' | 'full';
 }
 
 const MAX_TOOL_RESULT_CHARS = 9000;
@@ -58,11 +43,8 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
   const maxToolCalls = options.maxToolCalls ?? 12;
   const maxRevisions = options.maxRevisions ?? 1;
   const validation = options.validation ?? 'basic';
-  const byName = new Map([...tools, ...(options.leanTools ?? [])].map((tool) => [tool.name, tool]));
-  let activeTools = input.smallTalk ? [] : tools;
-  let toolSet: 'none' | 'lean' | 'full' = input.smallTalk ? 'none' : 'full';
-  let specs: Array<{ name: string; description: string; parameters: Record<string, unknown> }> = [];
-  const makeSpecs = () => activeTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
+  const byName = new Map(tools.map((tool) => [tool.name, tool]));
+  const specs = tools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
   const messages: ChatMessage[] = [{ role: 'system', content: input.system }, ...input.history, { role: 'user', content: input.userMessage }];
   const trace: TraceEntry[] = [];
   const evidence: EvidenceEntry[] = [];
@@ -76,10 +58,8 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
   let maxTokens = options.maxTokens ?? 1400;
   const historyText = input.history.map((message) => message.content ?? '').join('\n');
 
-  let hasPassages = false;
-  let confident = false;
-  if (!input.smallTalk && input.prefetchQueries?.length && byName.has('search_knowledge')) {
-    const args = JSON.stringify({ queries: input.prefetchQueries, limit: 3, maxChars: 3000 });
+  if (input.prefetchQueries?.length && byName.has('search_knowledge')) {
+    const args = JSON.stringify({ queries: input.prefetchQueries, limit: 4 });
     const { result, ms } = await executeTool('search_knowledge', args, byName, toolContext, cache, options.toolTimeoutMs ?? 25_000);
     if (result.status === 'ok') {
       const text = serialize(result);
@@ -87,33 +67,8 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
       messages.push({ role: 'tool', toolCallId: 'prefetch1', name: 'search_knowledge', content: text });
       trace.push({ step: 0, tool: 'search_knowledge', args: `(automatic) ${args.slice(0, 280)}`, status: result.status, ms });
       evidence.push({ tool: 'search_knowledge', kind: 'knowledge', args, status: result.status, text });
-      hasPassages = true;
-      // `confidence` is only a hint (it measures word overlap, not correctness), so it decides nothing that affects truth: only how much extra context to send.
-      confident = result.confidence === 'high' || result.confidence === 'medium';
     }
   }
-
-  // Token economy: the wiki outline is only useful when the automatic search was weak; the full tool set only when live data may be needed.
-  if (!input.smallTalk) {
-    if (!confident && input.weakEvidenceAddendum) messages[0] = { role: 'system', content: `${input.system}\n\n${input.weakEvidenceAddendum}` };
-    if (hasPassages && input.preferLean && options.leanTools?.length) { activeTools = options.leanTools; toolSet = 'lean'; }
-  }
-  specs = makeSpecs();
-  logger.info('Agent request prepared', { toolSet, tools: specs.length, passagesFound: hasPassages, confident, outlineIncluded: !input.smallTalk && !confident && Boolean(input.weakEvidenceAddendum), approxPromptChars: messages.reduce((n, m) => n + (m.content?.length ?? 0), 0) + JSON.stringify(specs).length });
-
-  // Answer cache: only for requests that are identical in everything the model would see (see AnswerCache).
-  const cacheKey = options.answerCache && !input.smallTalk ? AnswerCache.key({ messages, tools: specs.map((spec) => spec.name) }) : undefined;
-  const cachedAnswer = cacheKey ? options.answerCache!.get(cacheKey) : undefined;
-  if (cachedAnswer) {
-    logger.info('Answer served from cache (no model call)', { provider: cachedAnswer.provider });
-    return { answer: cachedAnswer.answer, trace, evidence, llmCalls: 0, revisions: 0, unresolvedIssues: [], provider: 'cache', cached: true, toolSet };
-  }
-  const finish = (outcome: AgentOutcome): AgentOutcome => {
-    const liveData = outcome.evidence.some((entry) => entry.kind === 'game');
-    if (cacheKey && !outcome.unresolvedIssues.length && !liveData && outcome.llmCalls > 0) options.answerCache!.set(cacheKey, { answer: outcome.answer, provider: outcome.provider });
-    return { ...outcome, toolSet };
-  };
-  let pendingDraft: { draft: string; issues: Issue[] } | undefined;
 
   for (;;) {
     step++;
@@ -121,17 +76,7 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
     if (lastChance && messages[messages.length - 1]?.role === 'tool') {
       messages.push({ role: 'user', content: '[system note] Tool budget reached. Answer the player now using only what you have gathered. If something is missing, say so plainly.' });
     }
-    let response;
-    try { response = await llm.chat({ messages, ...(specs.length ? { tools: specs } : {}), toolChoice: lastChance ? 'none' : 'auto', maxTokens, temperature: 0.3 }); }
-    catch (error) {
-      // The revision is an optional quality step. If the providers cannot do it right now, the answer we already have is returned (with the
-      // "could not verify" note added by the service) instead of throwing away a good draft and showing the player an error.
-      if (pendingDraft && error instanceof LlmError) {
-        logger.warn('Revision call failed; returning the first draft with a caveat instead of an error', { kind: error.kind, source: error.source, retryAfterSeconds: error.retryAfterSeconds });
-        return finish({ answer: pendingDraft.draft, trace, evidence, llmCalls, revisions, unresolvedIssues: pendingDraft.issues, provider });
-      }
-      throw error;
-    }
+    const response = await llm.chat({ messages, ...(specs.length ? { tools: specs } : {}), toolChoice: lastChance ? 'none' : 'auto', maxTokens, temperature: 0.3 });
     llmCalls++;
     provider = `${response.provider}:${response.model}`;
 
@@ -166,11 +111,10 @@ export async function runAgent(options: AgentOptions, input: AgentInput): Promis
     }
 
     const issues = validation === 'off' ? [] : await audit({ question: input.userMessage, history: historyText, answer: draft, evidence }, llm, validation === 'llm');
-    if (!issues.length) return finish({ answer: draft, trace, evidence, llmCalls, revisions, unresolvedIssues: [], provider });
+    if (!issues.length) return { answer: draft, trace, evidence, llmCalls, revisions, unresolvedIssues: [], provider };
     logger.info('Answer failed validation', { issues: issues.map((issue) => issue.code), revisions });
-    if (revisions >= maxRevisions) return finish({ answer: draft, trace, evidence, llmCalls, revisions, unresolvedIssues: issues, provider });
+    if (revisions >= maxRevisions) return { answer: draft, trace, evidence, llmCalls, revisions, unresolvedIssues: issues, provider };
     revisions++;
-    pendingDraft = { draft, issues };
     messages.push({ role: 'assistant', content: draft });
     messages.push({ role: 'user', content: `[system note — not from the player] Your draft has problems:\n${issues.map((issue) => `- ${issue.message}`).join('\n')}\nFix them. You may call tools if you need evidence. Reply with the corrected final answer only, in the player's language, without mentioning this note.` });
     step = Math.min(step, maxSteps - 2); // leave room for at least one tool round while revising

@@ -11,6 +11,8 @@ export interface OpenAiCompatibleConfig {
   apiKey: string;
   model: string;
   timeoutMs?: number;
+  /** Longest the local limiter may make a request wait before it throws a rate_limit error (so a failover provider can take over). Default 25 s. */
+  limiterMaxWaitMs?: number;
   /** Extra JSON body fields for provider-specific settings (reasoning effort etc.). */
   extraBody?: Record<string, unknown>;
   limits?: ProviderLimits;
@@ -27,7 +29,7 @@ function mapDailyQuota(error: unknown, config: OpenAiCompatibleConfig): unknown 
   const quota = config.dailyQuota;
   if (!quota || !(error instanceof LlmError) || error.kind === 'timeout' || error.kind === 'network' || error.kind === 'unauthorized') return error;
   if (!quota.pattern.test(error.details.providerMessage ?? error.message)) return error;
-  return new LlmError('rate_limit', error.message, { ...error.details, source: 'daily_quota', retryAfterSeconds: Math.max(error.retryAfterSeconds ?? 0, (quota.cooldownSeconds ?? secondsUntilUtcMidnight)()) });
+  return new LlmError('rate_limit', error.message, { ...error.details, retryAfterSeconds: Math.max(error.retryAfterSeconds ?? 0, (quota.cooldownSeconds ?? secondsUntilUtcMidnight)()) });
 }
 
 /** Remove reasoning blocks some models leak into `content`. */
@@ -48,26 +50,17 @@ export function toWireMessages(messages: ChatMessage[]): Array<Record<string, un
 export class OpenAiCompatibleProvider implements LlmProvider {
   readonly id: string;
   private readonly limiter: LocalLimiter | undefined;
-  /** Optional provider-specific parameters (e.g. reasoning_effort) that the provider rejected; they are left out from then on. */
-  private readonly droppedParams = new Set<string>();
   constructor(private readonly config: OpenAiCompatibleConfig, private readonly fetcher: FetchLike = fetch, limiter?: LocalLimiter, private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms))) {
     this.id = `${config.name}:${config.model}`;
-    this.limiter = limiter ?? (config.limits ? new LocalLimiter(config.limits) : undefined);
+    this.limiter = limiter ?? (config.limits ? new LocalLimiter(config.limits, Date.now, undefined, config.limiterMaxWaitMs ?? 25_000) : undefined);
   }
 
   async chat(request: ChatRequest): Promise<ChatResponse> {
     const estimated = estimateMessagesTokens(request.messages) + (request.tools ?? []).reduce((sum, tool) => sum + estimateTokens(JSON.stringify(tool)), 0) + Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS);
+    await this.limiter?.acquire(estimated, this.config.name);
     const budget = this.config.budget;
     const neuronEstimate = budget ? ((estimated - Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS)) * budget.inputPerMillion + Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS) * budget.outputPerMillion) / 1e6 : 0;
-    try {
-      await this.limiter?.acquire(estimated, this.config.name, this.config.model);
-      try { budget?.tracker.reserve(neuronEstimate, this.config.name); }
-      catch (error) { this.limiter?.settle(0, estimated); throw error; }
-    } catch (error) {
-      // Our own limits stopped this request: it was NOT sent to the provider. Say which limit, with the numbers.
-      if (error instanceof LlmError) logger.warn('LLM request blocked by a LOCAL limit (not sent to the provider)', { provider: this.config.name, model: this.config.model, source: error.source, limit: error.details.limit, requestedTokens: error.details.requestedTokens, usedTokens: error.details.usedTokens, maxTokens: error.details.maxTokens, retryAfterSeconds: error.retryAfterSeconds });
-      throw error;
-    }
+    budget?.tracker.reserve(neuronEstimate, this.config.name);
     const tools = request.tools?.length ? request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) : undefined;
     const body: Record<string, unknown> = {
       model: this.config.model,
@@ -76,17 +69,11 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       ...(tools ? { tools, tool_choice: request.toolChoice === 'none' ? 'none' : 'auto' } : {}),
       ...(request.json ? { response_format: { type: 'json_object' } } : {}),
-      ...Object.fromEntries(Object.entries(this.config.extraBody ?? {}).filter(([key]) => !this.droppedParams.has(key))),
+      ...this.config.extraBody,
     };
     let payload: unknown;
     try { payload = await this.send(body); }
-    catch (error) {
-      budget?.tracker.settle(0, neuronEstimate);
-      this.limiter?.settle(0, estimated);
-      const mapped = mapDailyQuota(error, this.config);
-      if (mapped instanceof LlmError) logger.warn('LLM provider rejected the request', { provider: this.config.name, model: this.config.model, kind: mapped.kind, status: mapped.status, source: mapped.source, reachedProvider: mapped.details.reachedProvider, retryAfterSeconds: mapped.retryAfterSeconds, detail: mapped.details.providerMessage });
-      throw mapped;
-    }
+    catch (error) { budget?.tracker.settle(0, neuronEstimate); throw mapDailyQuota(error, this.config); }
     const choice = (payload as { choices?: Array<{ message?: { content?: unknown; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: unknown } }> }; finish_reason?: string }>; usage?: { prompt_tokens?: number; completion_tokens?: number } })?.choices?.[0];
     if (!choice?.message) throw new LlmError('invalid_response', `${this.config.name} returned no choices`, { provider: this.config.name });
     const rawCalls = choice.message.tool_calls ?? [];
@@ -109,10 +96,6 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       try {
         return await postJson(this.fetcher, `${this.config.baseUrl.replace(/\/$/u, '')}/chat/completions`, this.config.apiKey, body, this.config.timeoutMs ?? 45_000, this.config.name);
       } catch (error) {
-        if (error instanceof LlmError && error.kind === 'bad_request') {
-          const optional = Object.keys(this.config.extraBody ?? {}).find((key) => !this.droppedParams.has(key) && key === 'reasoning_effort' && new RegExp(key.replace(/_/gu, '.?'), 'iu').test(error.details.providerMessage ?? ''));
-          if (optional) { logger.warn('Provider rejected an optional parameter; retrying without it from now on', { provider: this.config.name, model: this.config.model, parameter: optional }); this.droppedParams.add(optional); delete body[optional]; continue; }
-        }
         const retryable = error instanceof LlmError && (error.kind === 'unavailable' || error.kind === 'network' || (error.kind === 'rate_limit' && (error.retryAfterSeconds ?? 99) <= 5));
         if (!retryable || attempt >= retries) throw error;
         await this.sleep(error.kind === 'rate_limit' ? (error.retryAfterSeconds ?? 1) * 1000 : 600 * (attempt + 1));

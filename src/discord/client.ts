@@ -33,7 +33,7 @@ export function createDiscordClient(assistant: AssistantService, settings: Guild
     } catch (error) {
       const { failure, retryAfter, httpStatus } = failureInfo(error);
       const original = error instanceof Error ? error : new Error(String(error));
-      logger.error('Assistant message failed', { stage: 'discord_ticket_message', failure, guildId: message.guildId, userId: message.author.id, channelId: message.channelId, httpStatus, retryAfterSeconds: retryAfter, source: error instanceof LlmError ? error.source ?? 'unknown' : error instanceof AssistantRateLimitError ? 'application_request_gate' : undefined, reachedProvider: error instanceof LlmError ? error.details.reachedProvider : undefined, error: original.message, stack: original.stack });
+      logger.error('Assistant message failed', { stage: 'discord_ticket_message', failure, guildId: message.guildId, userId: message.author.id, channelId: message.channelId, httpStatus, retryAfterSeconds: retryAfter, error: original.message, stack: original.stack });
       const failureReply = failureMessage(failure, retryAfter);
       try { await message.reply({ content: failureReply, allowedMentions: { repliedUser: false } }); }
       catch (replyError) { const sendFailure = replyError instanceof Error ? replyError : new Error(String(replyError)); logger.error('Unable to send assistant error reply', { stage: 'discord_error_reply', guildId: message.guildId, channelId: message.channelId, error: sendFailure.message, stack: sendFailure.stack }); }
@@ -187,7 +187,7 @@ async function handleAsk(interaction: ChatInputCommandInteraction, assistant: As
 }
 
 function failureInfo(error: unknown): { failure: string; retryAfter?: number; httpStatus?: number } {
-  if (error instanceof AssistantRateLimitError) return { failure: 'app_limit', retryAfter: error.retryAfterSeconds };
+  if (error instanceof AssistantRateLimitError) return { failure: 'rate_limit', retryAfter: error.retryAfterSeconds };
   if (error instanceof LlmError) return { failure: error.kind, ...(error.retryAfterSeconds === undefined ? {} : { retryAfter: error.retryAfterSeconds }), ...(error.status === undefined ? {} : { httpStatus: error.status }) };
   return { failure: 'request_failed' };
 }
