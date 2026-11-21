@@ -24,28 +24,27 @@ Discord message
 ## Setup
 
 1. Node.js 22+ and npm. `npm install`.
-2. `cp .env.example .env`, fill in Discord values and at least one LLM key (Mistral recommended; see below).
+2. `cp .env.example .env`, fill in Discord values and at least one LLM key (Groq already works; see SETUP.md).
 3. Put game Markdown in `knowledge/` (the five bundled wiki files plus `00-glossary.md` are included).
 4. `npm run typecheck`, then `npm run dev` (or `npm run build && npm start`).
 5. In Discord use `/ping`, `/ask`, or talk in the configured assistant channel.
 
-## Free providers (verified against official docs on 2026-11-14; see SETUP.md for step-by-step setup)
+## Free providers (checked against official docs on 2026-11-20; see SETUP.md)
 
-| Provider | Card needed? | What the docs say | Role |
-| --- | --- | --- | --- |
-| **Mistral** (Experiment plan) | No (phone verification) | Free; limits only visible in the console; "API requests … may be used to train Mistral's models" | Main chat model |
-| **Gemini** (AI Studio, no billing) | No | `gemini-3.1-flash-lite` Stable (`gemini-3.5-flash-lite` newer, also Stable); embeddings `gemini-embedding-001`/`gemini-embedding-2` on the OpenAI-compatible endpoint; limits only visible in AI Studio; data used to improve products, human review possible, 18+ only, EEA/UK/CH need paid services | Backup chat + embeddings |
-| **Groq** (Free tier) | No (card only to upgrade) | `qwen/qwen3.8-27b`, `openai/gpt-oss-120b`: 30 req/min, 1K req/day, **8K tokens/min**, 200K tokens/day; no data retention by default, ZDR available | Last-resort backup only |
-| **Cloudflare Workers AI** (Free plan) | No | 10,000 neurons/day free, then calls fail (not billed); `@cf/baai/bge-m3` embeddings; OpenAI-compatible `/ai/v1/embeddings` | Optional hard-stop embeddings |
-| OpenRouter `:free` | Unclear | 20 req/min, **50 req/day** (1,000/day only after buying ≥10 credits) | Emergency only |
-| Cerebras | **Yes** (payment method required) | — | Excluded |
-| GitHub Models | — | **Retired 2026-07-30** | Excluded |
+Free-only by design: `src/llm/free-models.ts` is an allowlist; any model not on it is rejected at startup. Mistral and Gemini were removed from this version because their free status was not re-verified.
 
-**Privacy:** free tiers may use what you send; tell your members. **Cost safety:** the code only talks to the providers above and never switches plans; billing depends on your *account* settings (see SETUP.md section 8).
+| Provider | Card needed? | Free limits | Models allowed | Role |
+| --- | --- | --- | --- | --- |
+| **Groq** (Free plan) | Not stated in the docs I could read; your existing key works. Card is only needed to upgrade (not verified on an official page) | per model: 30 RPM, 1K RPD, **8K TPM**, 200K TPD | `qwen/qwen3.8-27b` (preview), `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `llama-3.3-70b-versatile`, `llama-3.1-8b-instant` | Primary + second bucket |
+| **Cloudflare Workers AI** (Free plan) | No payment method on the Free plan; some models need Workers Paid and are blocked | 10,000 neurons/day, then calls fail (not billed) | chat `@cf/openai/gpt-oss-120b`, `@cf/qwen/qwen3.8-27b`, `@cf/meta/llama-3.3-70b-instruct-fp8-fast`; embeddings `@cf/baai/bge-m3` | Backup + embeddings |
+| **OpenRouter** `:free` | Free models need no purchase per the limits page; account-signup card requirement not stated, so optional | 20 RPM, **50 requests/day** (1,000 only after buying credits - do not) | `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3.5-super-vl:free` | Last resort |
+| Mistral, Gemini | not re-verified | - | none (disabled) | Removed |
+
+**Safeguards:** allowlist; OpenRouter IDs must end in `:free`; requests carry one model only (no `models` fallback list); 429/quota errors cause cool-downs until reset; Cloudflare daily neuron budget tracked locally (max 10,000); logs name provider+model per request and redact keys. Billing still depends on your *account* plan (never upgrade).
 
 ## Environment variables
 
-See `.env.example` (complete, with placeholders) and `SETUP.md`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `MISTRAL_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
+See `.env.example` (complete, with placeholders) and `SETUP.md`: `DISCORD_TOKEN`, `DISCORD_CLIENT_ID`, `ASSISTANT_CHANNEL_ID`, `LLM_PRIMARY`, `LLM_BACKUP`, `GROQ_API_KEY` (legacy `GROQ_MODEL` still works), `OPENROUTER_API_KEY`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_DAILY_NEURON_BUDGET`, `CLOUDFLARE_REASONING_EFFORT`, `VALIDATION_MODE`, `LLM_LIMITS_<PROVIDER>`, `LLM_TIMEOUT_MS`, `DATABASE_PATH`, `KNOWLEDGE_DIR`, `LOG_LEVEL`.
 
 ## Commands
 

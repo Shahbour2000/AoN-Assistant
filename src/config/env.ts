@@ -9,8 +9,6 @@ const schema = z.object({
   LLM_BACKUP: z.string().trim().optional(),
   GROQ_API_KEY: z.string().trim().min(1).optional(),
   GROQ_MODEL: z.string().trim().min(1).optional(),
-  MISTRAL_API_KEY: z.string().trim().min(1).optional(),
-  GEMINI_API_KEY: z.string().trim().min(1).optional(),
   OPENROUTER_API_KEY: z.string().trim().min(1).optional(),
   CLOUDFLARE_API_TOKEN: z.string().trim().min(1).optional(),
   CLOUDFLARE_ACCOUNT_ID: z.string().trim().min(1).optional(),

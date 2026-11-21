@@ -1,10 +1,11 @@
 import { postJson, type FetchLike } from './http.js';
-import { LocalLimiter, type ProviderLimits } from './limiter.js';
+import { logger } from '../logging/logger.js';
+import { LocalLimiter, NeuronBudget, secondsUntilUtcMidnight, type ProviderLimits } from './limiter.js';
 import { estimateMessagesTokens, estimateTokens } from './tokens.js';
 import { LlmError, type ChatMessage, type ChatRequest, type ChatResponse, type Embedder, type LlmProvider, type ToolCall } from './types.js';
 
 export interface OpenAiCompatibleConfig {
-  /** Short provider name used in ids and logs, e.g. `mistral`. */
+  /** Short provider name used in ids and logs, e.g. `groq`. */
   name: string;
   baseUrl: string;
   apiKey: string;
@@ -15,6 +16,18 @@ export interface OpenAiCompatibleConfig {
   limits?: ProviderLimits;
   /** Maximum number of automatic retries for short 429/5xx waits inside this provider. */
   retries?: number;
+  /** Workers AI: shared daily free-neuron budget and this model's published neuron prices (per million tokens). */
+  budget?: { tracker: NeuronBudget; inputPerMillion: number; outputPerMillion: number };
+  /** Error text that means "today's free quota is gone"; such errors become a rate_limit with a long cool-down so the provider is not retried until it resets. */
+  dailyQuota?: { pattern: RegExp; cooldownSeconds?: () => number };
+}
+
+/** Convert provider-specific "daily free quota exhausted" failures into a rate_limit with a retry time. */
+function mapDailyQuota(error: unknown, config: OpenAiCompatibleConfig): unknown {
+  const quota = config.dailyQuota;
+  if (!quota || !(error instanceof LlmError) || error.kind === 'timeout' || error.kind === 'network' || error.kind === 'unauthorized') return error;
+  if (!quota.pattern.test(error.details.providerMessage ?? error.message)) return error;
+  return new LlmError('rate_limit', error.message, { ...error.details, retryAfterSeconds: Math.max(error.retryAfterSeconds ?? 0, (quota.cooldownSeconds ?? secondsUntilUtcMidnight)()) });
 }
 
 /** Remove reasoning blocks some models leak into `content`. */
@@ -43,6 +56,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
   async chat(request: ChatRequest): Promise<ChatResponse> {
     const estimated = estimateMessagesTokens(request.messages) + (request.tools ?? []).reduce((sum, tool) => sum + estimateTokens(JSON.stringify(tool)), 0) + Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS);
     await this.limiter?.acquire(estimated, this.config.name);
+    const budget = this.config.budget;
+    const neuronEstimate = budget ? ((estimated - Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS)) * budget.inputPerMillion + Math.min(request.maxTokens ?? 1024, COMPLETION_RESERVE_TOKENS) * budget.outputPerMillion) / 1e6 : 0;
+    budget?.tracker.reserve(neuronEstimate, this.config.name);
     const tools = request.tools?.length ? request.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) : undefined;
     const body: Record<string, unknown> = {
       model: this.config.model,
@@ -53,7 +69,9 @@ export class OpenAiCompatibleProvider implements LlmProvider {
       ...(request.json ? { response_format: { type: 'json_object' } } : {}),
       ...this.config.extraBody,
     };
-    const payload = await this.send(body);
+    let payload: unknown;
+    try { payload = await this.send(body); }
+    catch (error) { budget?.tracker.settle(0, neuronEstimate); throw mapDailyQuota(error, this.config); }
     const choice = (payload as { choices?: Array<{ message?: { content?: unknown; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: unknown } }> }; finish_reason?: string }>; usage?: { prompt_tokens?: number; completion_tokens?: number } })?.choices?.[0];
     if (!choice?.message) throw new LlmError('invalid_response', `${this.config.name} returned no choices`, { provider: this.config.name });
     const rawCalls = choice.message.tool_calls ?? [];
@@ -65,6 +83,8 @@ export class OpenAiCompatibleProvider implements LlmProvider {
     const content = typeof choice.message.content === 'string' ? stripReasoning(choice.message.content) : '';
     const usage = (payload as { usage?: { prompt_tokens?: number; completion_tokens?: number } }).usage;
     if (usage?.prompt_tokens !== undefined) this.limiter?.settle((usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0), estimated);
+    if (budget && usage?.prompt_tokens !== undefined) budget.tracker.settle(((usage.prompt_tokens ?? 0) * budget.inputPerMillion + (usage.completion_tokens ?? 0) * budget.outputPerMillion) / 1e6, neuronEstimate);
+    logger.info('LLM request served', { provider: this.config.name, model: this.config.model, promptTokens: usage?.prompt_tokens, completionTokens: usage?.completion_tokens, toolCalls: toolCalls.length, ...(budget ? { neuronsUsedToday: Math.round(budget.tracker.usedToday) } : {}) });
     return { content, toolCalls, finishReason: choice.finish_reason, usage: usage ? { promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens } : undefined, provider: this.config.name, model: this.config.model };
   }
 
@@ -85,7 +105,7 @@ export class OpenAiCompatibleProvider implements LlmProvider {
 /** Tokens reserved for the answer when checking local limits (the real usage replaces it afterwards). Reserving the full max_tokens made a single call look 2-3x bigger than it was. */
 const COMPLETION_RESERVE_TOKENS = 600;
 
-export interface EmbeddingConfig { name: string; baseUrl: string; apiKey: string; model: string; timeoutMs?: number; batchSize?: number; /** max requests/minute we allow ourselves */ rpm?: number; }
+export interface EmbeddingConfig { budget?: { tracker: NeuronBudget; neuronsPerMillionTokens: number }; dailyQuota?: OpenAiCompatibleConfig['dailyQuota']; name: string; baseUrl: string; apiKey: string; model: string; timeoutMs?: number; batchSize?: number; /** max requests/minute we allow ourselves */ rpm?: number; }
 
 /** OpenAI-compatible `/embeddings` client (works for Mistral and Gemini's OpenAI-compatible endpoint). */
 export class OpenAiCompatibleEmbedder implements Embedder {
@@ -101,7 +121,12 @@ export class OpenAiCompatibleEmbedder implements Embedder {
     for (let start = 0; start < texts.length; start += batch) {
       const slice = texts.slice(start, start + batch).map((text) => text.slice(0, 6000));
       await this.limiter?.acquire(0, this.config.name);
-      const payload = await postJson(this.fetcher, `${this.config.baseUrl.replace(/\/$/u, '')}/embeddings`, this.config.apiKey, { model: this.config.model, input: slice }, this.config.timeoutMs ?? 30_000, this.config.name) as { data?: Array<{ embedding?: number[]; index?: number }> };
+      const budget = this.config.budget;
+      const neurons = budget ? (slice.reduce((sum, text) => sum + estimateTokens(text), 0) * budget.neuronsPerMillionTokens) / 1e6 : 0;
+      budget?.tracker.reserve(neurons, this.config.name);
+      let payload: { data?: Array<{ embedding?: number[]; index?: number }> };
+      try { payload = await postJson(this.fetcher, `${this.config.baseUrl.replace(/\/$/u, '')}/embeddings`, this.config.apiKey, { model: this.config.model, input: slice }, this.config.timeoutMs ?? 30_000, this.config.name) as typeof payload; }
+      catch (error) { budget?.tracker.settle(0, neurons); throw mapDailyQuota(error, this.config as unknown as OpenAiCompatibleConfig); }
       const rows = payload.data;
       if (!Array.isArray(rows) || rows.length !== slice.length) throw new LlmError('invalid_response', `${this.config.name} embeddings response had unexpected shape`, { provider: this.config.name });
       const ordered = [...rows].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));

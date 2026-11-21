@@ -83,11 +83,11 @@ test('all local Age of Nations wiki files load and are retrievable by their own 
 
 test('LLM provider configuration is explicit, validates keys, and keeps legacy GROQ_API_KEY working', async () => {
   assert.throws(() => buildLlm({}), /LLM_PRIMARY/);
-  assert.throws(() => buildLlm({ LLM_PRIMARY: 'mistral' }), /MISTRAL_API_KEY/);
-  assert.throws(() => buildLlm({ LLM_PRIMARY: 'openrouter:openai/gpt-oss-120b', OPENROUTER_API_KEY: 'k' }), /:free/);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'cloudflare' }), /CLOUDFLARE_API_TOKEN/);
+  assert.throws(() => buildLlm({ LLM_PRIMARY: 'openrouter:openai/gpt-oss-120b', OPENROUTER_API_KEY: 'k' }), /not on the approved free-model list/);
   assert.deepEqual(buildLlm({ GROQ_API_KEY: 'k' }).specs, [{ provider: 'groq', model: 'qwen/qwen3.8-27b' }]);
   const warnings: string[] = [];
-  const built = buildLlm({ LLM_PRIMARY: 'mistral:mistral-large-latest', MISTRAL_API_KEY: 'k', LLM_BACKUP: 'groq:openai/gpt-oss-120b' }, undefined, (m) => warnings.push(m));
+  const built = buildLlm({ LLM_PRIMARY: 'groq:openai/gpt-oss-120b', GROQ_API_KEY: 'k', LLM_BACKUP: 'cloudflare' }, undefined, (m) => warnings.push(m));
   assert.equal(built.specs.length, 1);
-  assert.match(warnings[0] ?? '', /GROQ_API_KEY/);
+  assert.match(warnings[0] ?? '', /CLOUDFLARE_API_TOKEN/);
 });

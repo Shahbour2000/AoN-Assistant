@@ -14,6 +14,15 @@ export function parseRetryAfter(value: string | null, now = Date.now()): number 
   return Number.isFinite(date) ? Math.max(0, Math.ceil((date - now) / 1000)) : undefined;
 }
 
+/** `x-ratelimit-reset` is a Unix timestamp in milliseconds (OpenRouter) or seconds; returns seconds from now. */
+export function parseRateLimitReset(value: string | null, now = Date.now()): number | undefined {
+  if (!value) return undefined;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) return undefined;
+  const epochMs = number > 1e12 ? number : number > 1e9 ? number * 1000 : undefined;
+  return epochMs === undefined ? undefined : Math.max(1, Math.ceil((epochMs - now) / 1000));
+}
+
 /** POST JSON and map every failure to a typed LlmError. Never logs or returns credentials. */
 export async function postJson(fetcher: FetchLike, url: string, apiKey: string, body: unknown, timeoutMs: number, provider: string, headers: Record<string, string> = {}): Promise<unknown> {
   let response: Response;
@@ -30,7 +39,7 @@ export async function postJson(fetcher: FetchLike, url: string, apiKey: string, 
     try { const parsed = JSON.parse(text) as { error?: { message?: unknown } | string; message?: unknown }; const err = parsed.error; providerMessage = typeof err === 'string' ? err : typeof err?.message === 'string' ? err.message : typeof parsed.message === 'string' ? parsed.message : providerMessage; } catch { /* keep raw text */ }
     providerMessage = redact(providerMessage);
     const status = response.status;
-    const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after'));
+    const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after')) ?? (status === 429 ? parseRateLimitReset(response.headers.get('x-ratelimit-reset')) : undefined);
     const kind = status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : status === 429 ? 'rate_limit' : status === 408 ? 'timeout' : status >= 500 ? 'unavailable' : 'bad_request';
     throw new LlmError(kind, `${provider} HTTP ${status}: ${providerMessage}`, { provider, status, providerMessage, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) });
   }

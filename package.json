@@ -11,8 +11,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.check.json",
-    "test": "tsx --test test/foundation.test.ts test/integration.test.ts test/llm.test.ts test/knowledge.test.ts test/agent.test.ts test/service.test.ts test/regression.test.ts",
-    "test:offline": "tsx --test test/llm.test.ts test/knowledge.test.ts test/agent.test.ts",
+    "test": "tsx --test test/foundation.test.ts test/integration.test.ts test/llm.test.ts test/free-only.test.ts test/knowledge.test.ts test/agent.test.ts test/service.test.ts test/regression.test.ts",
+    "test:offline": "tsx --test test/llm.test.ts test/free-only.test.ts test/knowledge.test.ts test/agent.test.ts",
     "eval": "tsx eval/run.ts",
     "check:providers": "tsx eval/check-providers.ts"
   },

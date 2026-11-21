@@ -1,78 +1,57 @@
-# Setup guide (beginner friendly)
+# Setup guide (free-only)
 
-Goal: run the bot with **free** AI services only, without adding a payment card anywhere.
-Plan: **Mistral** (main brain) → **Gemini** (backup + search embeddings) → optional **Groq** (extra backup) and **Cloudflare** (extra-safe embeddings).
-Website menus change from time to time; if a button has a slightly different name, look for the closest one.
+Goal: run the bot on **free AI tiers only**, with no card, no credits and no pay-as-you-go anywhere.
+Order of use: **Groq** (Qwen 3.8 27B) -> **Groq** (gpt-oss-120b, separate quota) -> **Cloudflare Workers AI** (gpt-oss-120b) -> **OpenRouter** (Gemma 4, only 50 requests/day). Embeddings: **Cloudflare bge-m3**.
 
 ## 0. Rules that keep it free
-- Never type a credit card into any of these sites for this bot. If a page asks for a card to "upgrade", close it.
-- A free key that runs out of quota simply returns an error ("rate limit") — the bot then waits or uses the backup. It cannot bill you.
-- Keep keys secret: they go only in the file `.env` on your computer/server. Never post them in Discord, GitHub, screenshots or chat. If one leaks, delete it on the provider's site and create a new one.
-- Privacy: free tiers may use what you send them. Mistral's free "Experiment" plan: *"API requests … may be used to train Mistral's models."* Gemini's free tier: Google uses inputs/outputs to improve products and humans may review them; **you must be 18+, the API must not be offered to under-18 users, and in the EEA/UK/Switzerland Google requires paid services**. Groq: does not retain inference data by default (can be switched to zero retention in its settings). Tell your server members that their questions go to these services.
+- Never enter a credit card, buy credits or upgrade a plan on Groq, Cloudflare or OpenRouter for this bot.
+- The bot only accepts model IDs listed in `src/llm/free-models.ts`. Anything else (a typo, a paid model) stops startup with an error before any request is sent.
+- When a free quota runs out the provider returns an error; the bot switches to the next provider and does not retry the exhausted one until its limit resets.
+- Keep keys only in `.env`. Never post them anywhere. If one leaks, delete it on the provider's site and create a new one.
+- Privacy: free tiers may log or use prompts (OpenRouter free models especially). Tell your members that questions go to these services.
 
-## 1. Mistral key (main model) — free, no card
-1. Open https://console.mistral.ai and create an account (email or Google).
-2. Create/choose your workspace and pick the **Experiment** (free) plan. It asks you to verify a **phone number**; no card is needed.
-3. Open **API Keys** in the left menu → **Create new key** → name it `aon-bot` → copy the key (shown once).
-4. In `.env`: `MISTRAL_API_KEY=` + the key.
-5. Free limits are shown inside the console (Admin → Limits); Mistral does not publish them on its help page.
+## 1. Groq (you already have this)
+Check once at https://console.groq.com -> Settings -> Billing that the plan says **Free** (not Developer). Do not upgrade.
 
-## 2. Gemini key (backup + embeddings) — free, no card
-1. Open https://aistudio.google.com/apikey and sign in with a Google account (18+).
-2. Click **Create API key** → choose **Create API key in new project** (a brand-new project has no billing).
-3. **Do not** click anything called "Set up billing" / "Upgrade". Free-tier usage is limited per project, and your limits are listed in AI Studio (Dashboard → rate limits).
-4. Copy the key. In `.env`: `GEMINI_API_KEY=` + the key.
+## 2. Cloudflare Workers AI (new)
+1. Free account at https://dash.cloudflare.com (stay on the **Free** plan; never subscribe to Workers Paid).
+2. Copy your **Account ID** -> `CLOUDFLARE_ACCOUNT_ID=`.
+3. https://dash.cloudflare.com/profile/api-tokens -> Create Token -> **Workers AI** template -> copy the token -> `CLOUDFLARE_API_TOKEN=`.
+Free allowance: 10,000 neurons/day (resets 00:00 UTC), shared by chat and embeddings. When it is used up, calls fail; they are not billed.
 
-## 3. Optional: Groq key (extra backup)
-1. Open https://console.groq.com → sign up → **API Keys** → **Create API Key**.
-2. In `.env`: `GROQ_API_KEY=` + the key. The free plan allows only 8,000 tokens/minute, so it is a last-resort backup, never the main model.
-3. Optional privacy: in Groq console **Data Controls**, turn on **Zero Data Retention**.
+## 3. OpenRouter (optional, last resort)
+Create a key at https://openrouter.ai/keys -> `OPENROUTER_API_KEY=`. Do not buy credits. Free models are limited to 20 requests/minute and 50 requests/day in total. If you do not want it, leave the key empty and remove it from `LLM_BACKUP`.
 
-## 4. Optional: Cloudflare (safest embeddings)
-The free plan gives 10,000 "neurons" a day and **stops** (does not bill) when they are used up.
-1. Create a free account at https://dash.cloudflare.com (no card needed for the free plan).
-2. Copy your **Account ID** (shown on the account home page / in the right-hand sidebar of Workers & Pages). Put it in `.env` as `CLOUDFLARE_ACCOUNT_ID=`.
-3. Go to https://dash.cloudflare.com/profile/api-tokens → **Create Token** → use the **Workers AI** template (or a custom token with *Workers AI: Read* and *Edit*) → create → copy the token → `CLOUDFLARE_API_TOKEN=`.
-4. If you want Cloudflare instead of Gemini for embeddings: `EMBEDDING_PROVIDER=cloudflare`. Otherwise leave `auto`.
-
-## 5. Create your `.env`
+## 4. Add these lines to your existing `.env` (do not delete anything)
 ```
-cp .env.example .env        # Windows: copy .env.example .env
+CLOUDFLARE_ACCOUNT_ID=
+CLOUDFLARE_API_TOKEN=
+OPENROUTER_API_KEY=
+LLM_PRIMARY=groq:qwen/qwen3.8-27b
+LLM_BACKUP=groq:openai/gpt-oss-120b,cloudflare:@cf/openai/gpt-oss-120b,openrouter:google/gemma-4-26b-a4b-it:free
+EMBEDDING_PROVIDER=cloudflare
 ```
-Open `.env` in a text editor and replace the placeholder values (`put-...-here`) with your real keys. Keep these lines:
-```
-LLM_PRIMARY=mistral:mistral-large-latest
-LLM_BACKUP=gemini:gemini-3.1-flash-lite,groq:qwen/qwen3.8-27b
-EMBEDDING_PROVIDER=auto
-```
-Leave `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `CLOUDFLARE_*` empty if you skipped those steps (missing backups are skipped automatically).
+Fill in the three keys. Leave `GROQ_API_KEY` and `GROQ_MODEL` as they are. A backup whose key is missing is skipped with a warning.
 
-## 6. Check everything
+## 5. Check
 ```
 npm install
 npm run typecheck
 npm test
 npm run check:providers
 ```
-`npm run check:providers` calls each provider with a tiny test and prints ✓ / ✗:
-- ✓ chat model ids exist (if it says `NOT LISTED` for `mistral-large-latest`, copy an id from the list it prints into `LLM_PRIMARY`);
-- ✓ one chat call works;
-- ✓ embeddings work, and **English↔Arabic similarity is higher than for unrelated text** (this is the cross-language search test).
+`check:providers` makes real calls (3 per chat model; OpenRouter counts against its 50/day) and reports per model: chat, **tool calling**, Arabic reply; and for embeddings an English-Arabic similarity test. Only models that print tool calling OK should be primary. Delete the first `embeddings.json` in `data/` if you switch embedding models (it is rebuilt automatically).
 
-If embeddings say `NONE`, search is keyword-only: Arabic questions work, English questions may miss Arabic wiki text.
-
-## 7. Run the bot, then evaluate
+## 6. Run
 ```
-npm run dev                 # development
-npm run build && npm start  # production
-npm run eval                # real conversation tests (uses some free quota). EVAL_PACE_SECONDS=10 npm run eval  for strict limits
+npm run dev
 ```
-At startup the log must say `mode: 'hybrid'` and `embedder: gemini:...` (or cloudflare/mistral). `mode: 'keyword'` means embeddings are not configured.
-The first start embeds the wiki once (about 270 passages) and saves it in `data/embeddings.json`; later starts reuse it.
+Logs show `LLM request served` with `provider` and `model` for every request, and `LLM provider failed, trying next` (with the cool-down) on failover. At startup the log must say `mode: 'hybrid'`.
 
-## 8. Avoid accidental billing — checklist
-- Mistral: stay on **Experiment**; do not switch to a paid plan.
-- Gemini: use a key from a project **without billing**; never link a billing account to it.
-- Never add a card to Groq/Cloudflare/OpenRouter for this bot (OpenRouter's free models are capped at 50 requests/day unless you buy credits).
-- Do not put paid model names in `LLM_PRIMARY`/`LLM_BACKUP`. The bot only accepts the providers listed above, and OpenRouter models must end in `:free`.
-- Check `.gitignore` contains `.env` before every `git push`.
+## 7. Expected capacity (estimates, not measured)
+Each answer uses roughly 1-3 model calls of about 4-7K tokens. Groq's 8K tokens/minute makes it slow for big prompts; its daily limit is per model. Rough free capacity: tens of questions per day in total. If everything is exhausted the bot replies that it is temporarily unavailable.
+
+## 8. Billing checklist
+- Groq plan = Free. Cloudflare plan = Free. OpenRouter: zero credits purchased.
+- Never put model IDs outside the allowlist in `.env`; the bot refuses them.
+- `.env` must be in `.gitignore`.

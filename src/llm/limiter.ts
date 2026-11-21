@@ -55,3 +55,42 @@ export class LocalLimiter {
     return Math.max(0, Math.ceil(wait));
   }
 }
+
+/** Seconds from `now` until the next 00:00 UTC (when Cloudflare's free neuron allowance resets). */
+export function secondsUntilUtcMidnight(now: number = Date.now()): number {
+  const next = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate() + 1);
+  return Math.max(1, Math.ceil((next - now) / 1000));
+}
+
+/**
+ * Account-wide daily budget shared by every Workers AI chat model and the embedder (they all draw from the same
+ * 10,000 free neurons per day). It is deliberately set below the real allowance. Cloudflare itself hard-stops at the
+ * limit instead of billing, so this budget only avoids wasted calls — it is not what protects you from charges.
+ */
+export class NeuronBudget {
+  private day = '';
+  private used = 0;
+  constructor(private readonly dailyLimit: number, private readonly now: () => number = Date.now) {}
+
+  private roll(): void {
+    const today = new Date(this.now()).toISOString().slice(0, 10);
+    if (today !== this.day) { this.day = today; this.used = 0; }
+  }
+
+  /** Reserve `neurons`; throws a rate_limit error (with a retry time at the next UTC midnight) when the budget is spent. */
+  reserve(neurons: number, provider: string): void {
+    this.roll();
+    if (this.used + neurons > this.dailyLimit) {
+      throw new LlmError('rate_limit', `Local ${provider} free-neuron budget used up for today (${Math.round(this.used)}/${this.dailyLimit}); it resets at 00:00 UTC`, { provider, retryAfterSeconds: secondsUntilUtcMidnight(this.now()) });
+    }
+    this.used += neurons;
+  }
+
+  /** Replace an estimate with the real figure (or release it entirely with actual = 0 after a failed call). */
+  settle(actual: number, estimated: number): void {
+    this.roll();
+    this.used = Math.max(0, this.used - estimated + actual);
+  }
+
+  get usedToday(): number { this.roll(); return this.used; }
+}
