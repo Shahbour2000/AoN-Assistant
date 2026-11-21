@@ -41,7 +41,7 @@ export async function postJson(fetcher: FetchLike, url: string, apiKey: string, 
     const status = response.status;
     const retryAfterSeconds = parseRetryAfter(response.headers.get('retry-after')) ?? (status === 429 ? parseRateLimitReset(response.headers.get('x-ratelimit-reset')) : undefined);
     const kind = status === 401 ? 'unauthorized' : status === 403 ? 'forbidden' : status === 429 ? 'rate_limit' : status === 408 ? 'timeout' : status >= 500 ? 'unavailable' : 'bad_request';
-    throw new LlmError(kind, `${provider} HTTP ${status}: ${providerMessage}`, { provider, status, providerMessage, ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) });
+    throw new LlmError(kind, `${provider} HTTP ${status}: ${providerMessage}`, { provider, status, providerMessage, reachedProvider: true, ...(status === 429 ? { source: 'provider_429' as const } : {}), ...(retryAfterSeconds === undefined ? {} : { retryAfterSeconds }) });
   }
   try { return await response.json(); }
   catch { throw new LlmError('invalid_response', `${provider} returned invalid JSON`, { provider }); }

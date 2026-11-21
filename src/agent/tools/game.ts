@@ -76,7 +76,7 @@ async function resolvePlayer(ctx: ToolContext, reference: string | undefined): P
 export const findPlayer: AgentTool = {
   name: 'find_player',
   kind: 'game',
-  description: 'Look up ONE player by exact in-game username and return their live public profile (id, level, rank, country, damage totals, skills, economy summary). Use when the player names a specific user or asks about "my profile" after giving their username. The found player becomes the "active player" for follow-ups ("his damage?"). Never use for country names — countries are not players. Never guess usernames.',
+  description: 'Look up ONE player by exact username: live public profile (id, level, rank, country, damage, skills, economy). Becomes the active player for follow-ups. Never for country names; never guess usernames.',
   parameters: { type: 'object', properties: { username: { type: 'string', description: 'Exact in-game username as the player wrote it.' } }, required: ['username'], additionalProperties: false },
   async execute(args, ctx) {
     const username = str(args, 'username', { max: 40 })!;
@@ -91,7 +91,7 @@ export const findPlayer: AgentTool = {
 export const getPlayerData: AgentTool = {
   name: 'get_player_data',
   kind: 'game',
-  description: 'Fetch live numbers for a player: "stats" (lifetime and 30/7/1-day damage, work, trade, company totals), "profile" (level, rank, skills, economy) and/or "companies" (the player\'s companies). Omit "player" to use the active player from the conversation (follow-ups like "and his companies?"). Pass a username or a player id (usr_…) to switch players.',
+  description: 'Live numbers for a player: "stats" (damage, work, trade, company totals), "profile" (level, rank, skills, economy), "companies". Omit "player" for the active player; or pass a username/id (usr_…).',
   parameters: { type: 'object', properties: { player: { type: 'string', description: 'Username or player id. Omit for the active player.' }, include: { type: 'array', items: { type: 'string', enum: ['stats', 'profile', 'companies'] }, minItems: 1, maxItems: 3, description: 'Which data to fetch (default ["stats"]).' } }, additionalProperties: false },
   async execute(args, ctx) {
     const reference = str(args, 'player', { optional: true, max: 80 });
@@ -132,7 +132,7 @@ export const getPlayerData: AgentTool = {
 export const searchGame: AgentTool = {
   name: 'search_game',
   kind: 'game',
-  description: 'Search the live game for players, countries, regions, military units, parties, alliances and articles by name. Use it to resolve a name to an id and to tell what kind of thing a name is (a country such as "Egypt" is NOT a player named Egypt). The result groups matches by type — read the type before assuming anything.',
+  description: 'Search the live game by name for players, countries, regions, units, parties, alliances, articles. Resolves a name to an id and tells what type it is (a country is NOT a player); read the type first.',
   parameters: { type: 'object', properties: { query: { type: 'string', description: 'Name or partial name.' } }, required: ['query'], additionalProperties: false },
   async execute(args, ctx) {
     const query = str(args, 'query', { max: 60 })!;
@@ -182,7 +182,7 @@ async function resolveCountry(ctx: ToolContext, reference: string): Promise<{ ok
 export const getCountry: AgentTool = {
   name: 'get_country',
   kind: 'game',
-  description: 'Live information about one country: "overview" (citizens total/active — i.e. population, development, taxes, treasury, specialized item, government holders, wars, alliance), plus sections "citizens", "government" (current office holders), "wars", "battles", "companies" (production totals), "units", "parties", "elections", "laws", or "summary" (government, wars, battles, laws, elections together). Accepts a country id (e.g. "eg") or an English name (e.g. "Egypt").',
+  description: 'Live info about one country: "overview" (population, development, taxes, treasury, government, wars, alliance) or a section: citizens, government, wars, battles, companies, units, parties, elections, laws, summary. Accepts id ("eg") or English name.',
   parameters: { type: 'object', properties: { country: { type: 'string', description: 'Country id (e.g. "eg") or name (e.g. "Egypt").' }, section: { type: 'string', enum: [...COUNTRY_SECTIONS], description: 'Default "overview".' } }, required: ['country'], additionalProperties: false },
   async execute(args, ctx) {
     const reference = str(args, 'country', { max: 60 })!;
@@ -205,7 +205,7 @@ const WEALTH_BOARDS = new Set(['playerWealth', 'muTreasury', 'countryTreasury'])
 export const getRankings: AgentTool = {
   name: 'get_rankings',
   kind: 'game',
-  description: 'Leaderboards: top players by damage/level/work/trade/wealth, military units, countries (damage, development, active population, regions, treasury) or alliances. Optionally scoped to a country id (player and unit boards) and a period (all, monthly, weekly, daily, or current for live boards).',
+  description: 'Leaderboards: top players (damage/level/work/trade/wealth), military units, countries, alliances; optional country id and period (all, monthly, weekly, daily, current).',
   parameters: { type: 'object', properties: { board: { type: 'string', enum: [...BOARDS] }, period: { type: 'string', enum: ['all', 'monthly', 'weekly', 'daily', 'current'], description: 'Default: "all" for damage/work/trade boards, otherwise "current".' }, countryId: { type: 'string', description: 'Optional country id such as "eg".' }, limit: { type: 'integer', minimum: 1, maximum: 25, description: 'Default 10.' } }, required: ['board'], additionalProperties: false },
   async execute(args, ctx) {
     const board = oneOf(args, 'board', BOARDS);
@@ -227,7 +227,7 @@ export const getRankings: AgentTool = {
 export const getMarket: AgentTool = {
   name: 'get_market',
   kind: 'game',
-  description: 'Live market data: "prices" (best ask/bid and last price for every item), "orders" (order book of one item), "history" (price history of one item, in hours) or "trades" (recent trades of one item). Prices are in gold already converted; never infer profitability from a single price.',
+  description: 'Live market: "prices" (all items), "orders", "history" (hours) or "trades" of one item. Gold already converted; never infer profitability from one price.',
   parameters: { type: 'object', properties: { view: { type: 'string', enum: ['prices', 'orders', 'history', 'trades'] }, itemCode: { type: 'string', description: 'Item code such as "steel" (required except for "prices").' }, hours: { type: 'integer', minimum: 1, maximum: 720 }, market: { type: 'string', description: 'Country id for a local market; omit for the global (gold) market.' } }, required: ['view'], additionalProperties: false },
   async execute(args, ctx) {
     const view = oneOf(args, 'view', ['prices', 'orders', 'history', 'trades'] as const);
@@ -250,7 +250,7 @@ export const getMarket: AgentTool = {
 export const getWarsAndBattles: AgentTool = {
   name: 'get_wars_battles',
   kind: 'game',
-  description: 'Live wars between countries or battles, filtered by status (active/ended for wars, active/finished for battles) and optionally by country id.',
+  description: 'Live wars or battles filtered by status (wars: active/ended; battles: active/finished) and optional country id.',
   parameters: { type: 'object', properties: { kind: { type: 'string', enum: ['wars', 'battles'] }, status: { type: 'string', enum: ['active', 'ended', 'finished'] }, countryId: { type: 'string' } }, required: ['kind'], additionalProperties: false },
   async execute(args, ctx) {
     const kind = oneOf(args, 'kind', ['wars', 'battles'] as const);
@@ -267,7 +267,7 @@ export const getWarsAndBattles: AgentTool = {
 export const getCompany: AgentTool = {
   name: 'get_company',
   kind: 'game',
-  description: 'Live details of one company by company id (cmp_…), or — with no id — the richest companies in a country/globally. For a player\'s own companies use get_player_data with include ["companies"].',
+  description: 'Live details of one company by id (cmp_…), or the richest companies of a country/globally. A player\'s own companies: get_player_data with include ["companies"].',
   parameters: { type: 'object', properties: { companyId: { type: 'string' }, countryId: { type: 'string', description: 'When no companyId: list the richest companies of this country.' }, limit: { type: 'integer', minimum: 1, maximum: 20 } }, additionalProperties: false },
   async execute(args, ctx) {
     const companyId = str(args, 'companyId', { optional: true, max: 80 });
@@ -284,7 +284,7 @@ export const getCompany: AgentTool = {
 export const getGameRules: AgentTool = {
   name: 'get_game_rules',
   kind: 'game',
-  description: 'The live ruleset constants served by the game API: battle rules (rounds to win, points, health cost, cooldown, loot) and mercenary-contract rules. Use for exact battle/contract numbers; prefer the wiki (search_knowledge) for explanations.',
+  description: 'Live ruleset constants: battle rules (rounds, points, health cost, cooldown, loot) and mercenary-contract rules. Wiki (search_knowledge) explains; this gives exact numbers.',
   parameters: { type: 'object', properties: {}, additionalProperties: false },
   async execute(_args, ctx) {
     const outcome = await call(ctx, '/game');

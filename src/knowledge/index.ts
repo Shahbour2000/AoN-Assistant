@@ -66,8 +66,15 @@ export function parseGlossary(markdown: string): GlossaryEntry[] {
     const expansion = cells.slice(1).join(' ').replace(/[/()]/gu, ' ').trim();
     // A row whose slang is already the wiki's own word (same stem) teaches nothing and would only add noise.
     const expansionWords = new Set(tokenize(expansion));
-    const slang = triggers.filter((tokens) => !tokens.every((token) => expansionWords.has(token)));
+    // (Unless the row carries English terms: then even an Arabic phrase is useful, because it lets an Arabic question reach English wiki passages.)
+    const hasEnglish = /[A-Za-z]/u.test(cells.slice(2).join(' '));
+    const slang = hasEnglish ? triggers : triggers.filter((tokens) => !tokens.every((token) => expansionWords.has(token)));
     if (slang.length && expansion) entries.push({ triggers: slang, expansion });
+    // The English column works the other way round: an English query ("company founding cost") is expanded with the Arabic words the
+    // wiki uses, so English questions can find Arabic passages even in keyword-only mode.
+    const english = cells[2] ? cells[2].replace(/\([^)]*\)/gu, ' ').split(/[،,;]/u).map((phrase) => tokenize(phrase)).filter((tokens) => tokens.length > 0) : [];
+    const arabicSide = cells.slice(0, 2).join(' ').replace(/\([^)]*\)/gu, ' ').replace(/[/،,;]/gu, ' ').trim();
+    if (english.length && arabicSide) entries.push({ triggers: english, expansion: arabicSide });
   });
   return entries;
 }
@@ -228,7 +235,7 @@ export class KnowledgeBase {
       .map((entry) => ({ entry, size: Math.max(0, ...entry.triggers.filter((tokens) => tokens.every((token) => words.has(token))).map((tokens) => tokens.length)) }))
       .filter((item) => item.size > 0)
       .sort((a, b) => b.size - a.size)
-      .slice(0, 3);
+      .slice(0, 5);
     return matched.length ? `${query} ${matched.map((item) => item.entry.expansion).join(' ')}` : query;
   }
 

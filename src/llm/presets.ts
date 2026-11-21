@@ -8,7 +8,7 @@ import type { Embedder, LlmProvider } from './types.js';
 export type EnvLike = Record<string, string | undefined>;
 
 interface Preset {
-  /** May contain `{VAR}` placeholders that are filled from the environment (Cloudflare needs the account id). */
+  /** May contain braced upper-case placeholders that are filled from the environment (Cloudflare needs the account id). */
   baseUrl: string;
   keyEnv: string;
   defaultModel: string;
@@ -59,8 +59,21 @@ export const PROVIDER_PRESETS: Record<string, Preset> = {
   },
 };
 
-/** Order used only when LLM_PRIMARY is unset. */
-const AUTO_PRIMARY_ORDER = ['groq', 'cloudflare', 'openrouter'];
+/**
+ * The default free chain, built from the API keys that are actually present. A provider without its key(s) is simply not in the chain.
+ * Order: Groq's main model, then Cloudflare (no per-minute token ceiling), then Groq's second model (separate quota bucket), then OpenRouter
+ * (only 50 requests/day, so last). Used when LLM_PRIMARY is unset, and appended to an explicit chain by `LLM_BACKUP=auto`.
+ */
+export function defaultChain(env: EnvLike): ProviderSpec[] {
+  const has = (name: string) => Boolean(env[PROVIDER_PRESETS[name]!.keyEnv]?.trim()) && (name !== 'cloudflare' || Boolean(env.CLOUDFLARE_ACCOUNT_ID?.trim()));
+  const chain: ProviderSpec[] = [];
+  const groqMain = env.GROQ_MODEL?.trim() || PROVIDER_PRESETS.groq!.defaultModel;
+  if (has('groq')) chain.push({ provider: 'groq', model: groqMain });
+  if (has('cloudflare')) chain.push({ provider: 'cloudflare', model: PROVIDER_PRESETS.cloudflare!.defaultModel });
+  if (has('groq') && groqMain !== 'openai/gpt-oss-120b') chain.push({ provider: 'groq', model: 'openai/gpt-oss-120b' });
+  if (has('openrouter')) chain.push({ provider: 'openrouter', model: PROVIDER_PRESETS.openrouter!.defaultModel });
+  return chain;
+}
 
 /** Workers AI chat models and the embedder draw from ONE account-wide daily allowance, so they share one local budget. */
 const sharedBudgets = new Map<string, NeuronBudget>();
@@ -76,7 +89,7 @@ function cloudflareBudget(env: EnvLike): NeuronBudget {
   return budget;
 }
 
-/** Replace `{VAR}` placeholders with environment values; fails clearly when one is missing. */
+/** Replace braced placeholders with environment values; fails clearly when one is missing. */
 export function resolveBaseUrl(template: string, env: EnvLike): string {
   return template.replace(/\{([A-Z0-9_]+)\}/gu, (_match, name: string) => {
     const value = env[name]?.trim();
@@ -129,16 +142,24 @@ export function buildProvider(spec: ProviderSpec, env: EnvLike, fetcher?: FetchL
 
 /** Primary first, then backups in the listed order. Missing keys for *backups* are skipped with a warning; a missing primary key is an error. */
 export function buildLlm(env: EnvLike, fetcher?: FetchLike, warn: (message: string) => void = () => undefined): { llm: LlmProvider; specs: ProviderSpec[] } {
-  let rawPrimary = env.LLM_PRIMARY?.trim() ?? '';
+  const rawPrimary = env.LLM_PRIMARY?.trim() ?? '';
+  const backupText = env.LLM_BACKUP ?? '';
+  let primary: ProviderSpec;
+  let backups: ProviderSpec[] = [];
   if (!rawPrimary) {
-    // No explicit choice: pick the first provider that has a key, in the order Groq, Cloudflare, OpenRouter.
-    const auto = AUTO_PRIMARY_ORDER.find((name) => env[PROVIDER_PRESETS[name]!.keyEnv]?.trim());
-    if (!auto) throw new Error('No language model is configured. Set LLM_PRIMARY (for example "groq:qwen/qwen3.8-27b") and the matching API key (GROQ_API_KEY).');
-    rawPrimary = auto === 'groq' && env.GROQ_MODEL?.trim() ? `groq:${env.GROQ_MODEL.trim()}` : auto;
-    warn(`LLM_PRIMARY is not set; using "${rawPrimary}" because its API key is present. Set LLM_PRIMARY explicitly to choose the model.`);
+    const chain = defaultChain(env);
+    if (!chain.length) throw new Error('No language model is configured. Set LLM_PRIMARY (for example "groq:qwen/qwen3.8-27b") and the matching API key (GROQ_API_KEY), or just add API keys: with LLM_PRIMARY unset the bot builds a free chain from every provider that has a key.');
+    primary = chain[0]!;
+    backups = chain.slice(1);
+    warn(`LLM_PRIMARY is not set; using the default free chain built from the API keys present: ${chain.map((spec) => `${spec.provider}:${spec.model}`).join(' -> ')}. Set LLM_PRIMARY/LLM_BACKUP to choose explicitly.`);
+  } else {
+    primary = parseProviderSpec(rawPrimary);
+    const items = backupText.split(',').map((item) => item.trim()).filter(Boolean);
+    backups = items.filter((item) => item.toLowerCase() !== 'auto').map(parseProviderSpec);
+    if (items.some((item) => item.toLowerCase() === 'auto')) {
+      for (const spec of defaultChain(env)) if (![primary, ...backups].some((known) => known.provider === spec.provider && known.model === spec.model)) backups.push(spec);
+    }
   }
-  const primary = parseProviderSpec(rawPrimary);
-  const backups = (env.LLM_BACKUP ?? '').split(',').map((item) => item.trim()).filter(Boolean).map(parseProviderSpec);
   const providers: LlmProvider[] = [buildProvider(primary, env, fetcher)];
   const specs: ProviderSpec[] = [primary];
   for (const backup of backups) {
@@ -146,7 +167,7 @@ export function buildLlm(env: EnvLike, fetcher?: FetchLike, warn: (message: stri
     try { providers.push(buildProvider(backup, env, fetcher)); specs.push(backup); }
     catch (error) { warn(`Backup provider ${backup.provider}:${backup.model} skipped: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  return { llm: providers.length === 1 ? providers[0]! : new FailoverProvider(providers), specs };
+  return { llm: providers.length === 1 ? providers[0]! : new FailoverProvider(providers, { maxWaitMs: (Number(env.LLM_MAX_WAIT_SECONDS) || 45) * 1000 }), specs };
 }
 
 /** Embedding provider selection. Only Cloudflare Workers AI (bge-m3) is approved. `none` disables embeddings (keyword search only). */

@@ -1,7 +1,10 @@
 import type { LinkedPlayerRepository, MessageRepository } from '../database/repositories.js';
 import { runAgent, type AgentOutcome } from '../agent/loop.js';
 import { ConversationMemory } from '../agent/memory.js';
-import { buildSystemPrompt } from '../agent/prompt.js';
+import { AnswerCache } from '../agent/cache.js';
+import type { CachedAnswer } from '../agent/loop.js';
+import { buildOutlineAddendum, buildSystemPrompt } from '../agent/prompt.js';
+import { isSmallTalk, needsLiveData } from '../agent/routing.js';
 import { createTools, type ActivePlayer, type GameApi, type ToolContext } from '../agent/tools/index.js';
 import type { KnowledgeBase } from '../knowledge/index.js';
 import type { LlmProvider } from '../llm/types.js';
@@ -47,8 +50,10 @@ export function prefetchQueries(question: string, previousQuestion?: string): st
 export class AssistantService {
   private readonly memory: ConversationMemory;
   private readonly gate: AssistantRequestGate;
+  private readonly answerCache = new AnswerCache<CachedAnswer>();
   constructor(private readonly deps: AssistantDeps) {
-    this.memory = new ConversationMemory(deps.messages);
+    // Verbatim history is limited to ~1,400 tokens (older turns are summarised): every sent token counts against free-tier limits.
+    this.memory = new ConversationMemory(deps.messages, { historyTokens: 1400 });
     this.gate = deps.requestGate ?? new AssistantRequestGate();
   }
 
@@ -72,12 +77,17 @@ export class AssistantService {
       now: () => Date.now(),
     };
     const tools = createTools({ knowledge, api });
-    const system = buildSystemPrompt({ now: this.deps.now?.() ?? new Date(), knowledgeOutline: knowledge?.outline(), hasKnowledge: Boolean(knowledge), hasGameApi: Boolean(api), summary: memory.summary, activePlayer: active });
+    const leanTools = tools.filter((tool) => tool.kind !== 'game');
+    const smallTalk = isSmallTalk(input.question);
+    const mentor = /\[mentor\]\s*$/u.test(input.question);
+    // The wiki outline is NOT in the base prompt: it is added only if the automatic wiki search is not convincing (see runAgent).
+    const system = buildSystemPrompt({ now: this.deps.now?.() ?? new Date(), hasKnowledge: Boolean(knowledge), hasGameApi: Boolean(api), summary: memory.summary, activePlayer: active, smallTalk, mentor });
+    const preferLean = !smallTalk && !mentor && !active && !needsLiveData(input.question) && leanTools.length < tools.length;
 
     let outcome: AgentOutcome;
     try {
       const previousQuestion = [...memory.messages].reverse().find((message) => message.role === 'user')?.content ?? undefined;
-      outcome = await runAgent({ llm, tools, toolContext, validation: this.deps.validation ?? 'basic' }, { system, history: memory.messages, userMessage: input.question, prefetchQueries: prefetchQueries(input.question, previousQuestion) });
+      outcome = await runAgent({ llm, tools, leanTools, toolContext, validation: this.deps.validation ?? 'basic', answerCache: this.answerCache }, { system, history: memory.messages, userMessage: input.question, prefetchQueries: smallTalk ? [] : prefetchQueries(input.question, previousQuestion), smallTalk, preferLean, weakEvidenceAddendum: buildOutlineAddendum(knowledge?.outline(1500)) });
     } catch (error) {
       logger.error('Assistant pipeline failed', { guildId: input.guildId, userId: input.userId, conversationId: input.conversationId, error: error instanceof Error ? error.message : String(error) });
       throw error;
@@ -85,7 +95,7 @@ export class AssistantService {
 
     let answer = outcome.answer;
     if (outcome.unresolvedIssues.some((issue) => issue.code === 'ungrounded_numbers' || issue.code === 'unsupported_claims')) answer += UNVERIFIED_NOTE(/[؀-ۿ]/u.test(input.question));
-    logger.info('Assistant answered', { guildId: input.guildId, userId: input.userId, provider: outcome.provider, llmCalls: outcome.llmCalls, revisions: outcome.revisions, tools: outcome.trace.map((t) => `${t.tool}:${t.status}`), unresolved: outcome.unresolvedIssues.map((i) => i.code) });
+    logger.info('Assistant answered', { guildId: input.guildId, userId: input.userId, provider: outcome.provider, llmCalls: outcome.llmCalls, cached: outcome.cached ?? false, toolSet: outcome.toolSet, revisions: outcome.revisions, tools: outcome.trace.map((t) => `${t.tool}:${t.status}`), unresolved: outcome.unresolvedIssues.map((i) => i.code) });
     const sessionId = this.persist(input, historyScope, answer);
     void this.memory.maybeSummarise(sessionId, llm);
     return answer;

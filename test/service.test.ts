@@ -42,7 +42,7 @@ test('active player persists across turns in the same conversation only (public 
   await service.ask({ guildId: 'g', userId: 'u1', question: 'هات بيانات Egyptian', ...scope('c1') });
   const answer = await service.ask({ guildId: 'g', userId: 'u1', question: 'والضرر بتاعه؟', ...scope('c1') });
   assert.match(answer, /9876543/u);
-  assert.match(llm.requests[2]!.messages[0]!.content!, /Active player in this conversation: Egyptian \(id usr_abc123def456/u);
+  assert.match(llm.requests[2]!.messages[0]!.content!, /Active player: Egyptian \(id usr_abc123def456/u);
   const statsCall = llm.requests[3]!.messages.find((m) => m.role === 'tool')!.content!;
   assert.match(statsCall, /"all":"9876543"/u);
   await service.ask({ guildId: 'g', userId: 'u2', question: 'والضرر بتاعه؟', ...scope('c9') });
@@ -57,7 +57,6 @@ test('wiki-grounded answer end to end; unsupported numbers get an honesty caveat
   const service = new AssistantService({ llm, messages: new MessageRepository(db), knowledge: kb });
   const answer = await service.ask({ guildId: 'g', userId: 'u1', question: 'الشركة بكام؟' });
   assert.match(answer, /مقدرتش أتأكد/u);
-  assert.match(llm.requests[0]!.messages[0]!.content!, /02-economy\.md/u, 'wiki outline is in the prompt');
   db.close();
 });
 
@@ -99,5 +98,30 @@ test('provider failures propagate as typed errors (Discord layer shows a friendl
   await assert.rejects(() => service.ask({ guildId: 'g', userId: 'u1', question: 'x' }), (e: unknown) => e instanceof LlmError && e.retryAfterSeconds === 12);
   await assert.rejects(() => service.ask({ guildId: 'g', userId: 'u1', question: 'x' }), LlmError);
   await assert.rejects(() => service.ask({ guildId: 'g', userId: 'u1', question: 'x' }), AssistantRateLimitError);
+  db.close();
+});
+
+test('wiki outline is added to the prompt only when the automatic wiki search was weak; a strong match keeps the prompt small', async () => {
+  const db = openTestDatabase();
+  const kb = await KnowledgeBase.create({ dir: path.resolve('knowledge') });
+  const llm = new ScriptedLlm([{ content: 'تمام' }]);
+  const service = new AssistantService({ llm, messages: new MessageRepository(db), knowledge: kb });
+  await service.ask({ guildId: 'g', userId: 'u1', question: 'نظام الطيران الفضائي والصواريخ العابرة للقارات', ...scope('weak') });
+  assert.match(llm.requests[0]!.messages[0]!.content!, /02-economy\.md/u, 'weak evidence => outline helps the model search');
+  await service.ask({ guildId: 'g', userId: 'u2', question: 'تكلفة تأسيس الشركة الثالثة الفولاذ الخرسانة', ...scope('strong') });
+  const strong = llm.requests[1]!.messages[0]!.content!;
+  assert.doesNotMatch(strong, /02-economy\.md/u, 'strong evidence => no outline');
+  db.close();
+});
+
+test('a failure that reaches the player keeps the real reason: all providers limited => rate_limit with the real seconds, not the app gate', async () => {
+  const db = openTestDatabase();
+  const llm = { id: 'x', async chat() { throw new LlmError('rate_limit', 'all limited', { source: 'all_providers', retryAfterSeconds: 77 }); } };
+  const service = new AssistantService({ llm, messages: new MessageRepository(db) });
+  const error = await service.ask({ guildId: 'g', userId: 'u1', question: 'سؤال', ...scope('c') }).catch((e) => e);
+  assert.ok(error instanceof LlmError);
+  assert.equal(error.source, 'all_providers');
+  assert.equal(error.retryAfterSeconds, 77);
+  assert.ok(!(error instanceof AssistantRateLimitError));
   db.close();
 });

@@ -29,18 +29,18 @@ test('.env.example parses with the real config loader exactly as shipped (blank 
   for (const [name, value] of Object.entries(example)) if (/KEY|TOKEN/u.test(name)) assert.equal(value, '', `${name} must be blank in the template`);
 });
 
-test('an old .env (Discord + Groq only) still works unchanged: Groq is picked automatically, with a warning, and nothing else is required', () => {
+test('an old .env (Discord + Groq only) still works unchanged: Groq is picked automatically, with a notice, and nothing else is required', () => {
   const old = { DISCORD_TOKEN: 'x', DISCORD_CLIENT_ID: 'y', GROQ_API_KEY: 'gsk_abcdefgh', GROQ_MODEL: 'qwen/qwen3.8-27b', DATABASE_PATH: './data/aon-assistant.sqlite', KNOWLEDGE_DIR: './knowledge', LOG_LEVEL: 'info' };
   assert.equal(loadConfig(old).LOG_LEVEL, 'info');
   const warnings: string[] = [];
   const { specs } = buildLlm(old, undefined, (m) => { warnings.push(m); });
-  assert.deepEqual(specs, [{ provider: 'groq', model: 'qwen/qwen3.8-27b' }]);
+  assert.deepEqual(specs, [{ provider: 'groq', model: 'qwen/qwen3.8-27b' }, { provider: 'groq', model: 'openai/gpt-oss-120b' }], 'Groq main model, then Groq\'s second model (its own quota bucket)');
   assert.match(warnings[0] ?? '', /LLM_PRIMARY is not set/u);
   assert.equal(buildEmbedder(old), undefined, 'no embeddings key = keyword-only search, not a crash');
 });
 
 test('blank optional values never stop startup; invalid values are reported by name', () => {
-  assert.doesNotThrow(() => loadConfig({ GROQ_API_KEY: '', MISTRAL_API_KEY: '  ', OPENROUTER_API_KEY: '', LLM_PRIMARY: '' }));
+  assert.doesNotThrow(() => loadConfig({ GROQ_API_KEY: '', CLOUDFLARE_API_TOKEN: '  ', OPENROUTER_API_KEY: '', LLM_PRIMARY: '' }));
   assert.throws(() => loadConfig({ LOG_LEVEL: 'loud' }), /LOG_LEVEL/u);
   assert.throws(() => loadConfig({ VALIDATION_MODE: 'strict' }), /VALIDATION_MODE/u);
 });
@@ -54,12 +54,12 @@ test('documentation matches the code: every environment variable the program rea
   const presets = await readFile('src/llm/presets.ts', 'utf8');
   for (const m of presets.matchAll(/\{([A-Z][A-Z0-9_]+)\}/gu)) read.add(m[1]!);
   for (const m of (await readFile('src/config/env.ts', 'utf8')).matchAll(/^\s{2}([A-Z][A-Z0-9_]+): z\./gmu)) read.add(m[1]!);
-  for (const provider of ['MISTRAL', 'GEMINI', 'GROQ', 'OPENROUTER']) read.add(`LLM_LIMITS_${provider}`);
+  for (const provider of ['GROQ', 'CLOUDFLARE', 'OPENROUTER']) read.add(`LLM_LIMITS_${provider}`);
   const example = await readFile('.env.example', 'utf8');
   const setup = await readFile('SETUP.md', 'utf8');
   for (const name of read) {
     assert.ok(new RegExp(`\\b${name}\\b`, 'u').test(example), `${name} is read by the code but missing from .env.example`);
-    assert.ok(new RegExp(`\\b${name}\\b`, 'u').test(setup) || /^(LLM_LIMITS_|LLM_TIMEOUT_MS|GROQ_REASONING_EFFORT|EMBEDDING_MODEL)/u.test(name), `${name} is read by the code but missing from SETUP.md`);
+    assert.ok(new RegExp(`\\b${name}\\b`, 'u').test(setup) || /^(LLM_LIMITS_|LLM_TIMEOUT_MS|LLM_MAX_WAIT_SECONDS|GROQ_REASONING_EFFORT|CLOUDFLARE_REASONING_EFFORT|CLOUDFLARE_DAILY_NEURON_BUDGET|EMBEDDING_MODEL)/u.test(name), `${name} is read by the code but missing from SETUP.md`);
   }
   for (const name of Object.keys(parseEnvFile(example.replace(/^#\s*([A-Z][A-Z0-9_]+=)/gmu, '$1')))) assert.ok(read.has(name), `${name} is in .env.example but nothing in the code reads it`);
   assert.equal(read.has('ASSISTANT_CHANNEL_ID'), false, 'ASSISTANT_CHANNEL_ID was never used by the code and must stay removed');

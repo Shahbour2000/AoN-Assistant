@@ -15,14 +15,18 @@ const schema = z.object({
   EMBEDDING_MODEL: z.string().trim().optional(),
   EMBEDDING_PROVIDER: z.string().trim().optional(),
   VALIDATION_MODE: z.enum(['off', 'basic', 'llm']).default('basic'),
-  ASSISTANT_CHANNEL_ID: z.string().trim().min(1).optional(),
   DATABASE_PATH: z.string().default('./data/aon-assistant.sqlite'),
   KNOWLEDGE_DIR: z.string().default('./knowledge'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 });
 
-export function loadConfig() {
-  const result = schema.safeParse(process.env);
+/** A blank or whitespace-only value (`LLM_PRIMARY=` copied from .env.example) means "not set", never an error. */
+function withoutBlanks(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(env).map(([key, value]) => [key, typeof value === 'string' && value.trim() === '' ? undefined : value]));
+}
+
+export function loadConfig(env: Record<string, string | undefined> = process.env) {
+  const result = schema.safeParse(withoutBlanks(env));
   if (!result.success) {
     const invalid = result.error.issues.map((issue) => issue.path.join('.')).join(', ');
     throw new Error(`Invalid environment configuration. Check: ${invalid}`);
